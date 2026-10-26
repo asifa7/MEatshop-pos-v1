@@ -304,7 +304,7 @@ export default function GlobalFilterBar({
               className="w-full bg-surface-card border border-border-subtle rounded-lg px-2 py-1 text-xs text-text-primary font-medium outline-none focus:border-brand-500"
             >
               <option value="all">All Customer Types</option>
-              {filterOptions?.customerCategories.map(cat => (
+              {filterOptions?.customerCategories?.map(cat => (
                 <option key={cat} value={cat}>{cat}</option>
               ))}
             </select>
@@ -355,7 +355,7 @@ export default function GlobalFilterBar({
               className="w-full bg-surface-card border border-border-subtle rounded-lg px-2 py-1 text-xs text-text-primary font-medium outline-none focus:border-brand-500"
             >
               <option value="all">All Shifts</option>
-              {filterOptions?.shifts.map(s => (
+              {filterOptions?.shifts?.map(s => (
                 <option key={s.id} value={s.id}>{s.label}</option>
               ))}
             </select>

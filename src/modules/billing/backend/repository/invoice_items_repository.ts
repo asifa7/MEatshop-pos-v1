@@ -106,6 +106,24 @@ const invoiceItemsRepository = {
     `).run({ id, grams: quantityGrams, units: quantityUnits, subtotal: lineSubtotalPaise, total: lineTotalPaise });
   },
 
+  updateRateAndTotals(
+    id: number,
+    ratePaiseSnapshot: number,
+    lineSubtotalPaise: number,
+    lineTotalPaise: number,
+    overrideReason?: string | null
+  ): void {
+    db.prepare(`
+      UPDATE invoice_items
+      SET rate_paise_snapshot = @rate,
+          line_subtotal_paise = @subtotal,
+          line_total_paise = @total,
+          override_applied = 1,
+          override_reason = @reason
+      WHERE id = @id
+    `).run({ id, rate: ratePaiseSnapshot, subtotal: lineSubtotalPaise, total: lineTotalPaise, reason: overrideReason || 'Manual price override' });
+  },
+
   deleteById(id: number): void {
     db.prepare('DELETE FROM invoice_items WHERE id = ?').run(id);
   },

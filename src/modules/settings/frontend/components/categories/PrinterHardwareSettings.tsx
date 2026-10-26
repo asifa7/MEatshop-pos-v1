@@ -1158,9 +1158,9 @@ export const PrinterHardwareSettings: React.FC = () => {
               label="Auto Festival & Holiday Wishes"
               description="Automatically check the calendar and include festival wishes on auspicious dates"
             >
-              <ToggleControl
+              <SwitchControl
                 checked={tmpl?.whatsAppAutoFestivalWishes !== false}
-                onChange={(val) =>
+                onChange={(val: boolean) =>
                   updateDraftConfig((prev) => ({
                     ...prev,
                     receiptTemplate: { ...(prev.receiptTemplate || {}), whatsAppAutoFestivalWishes: val },

@@ -9,19 +9,39 @@ export interface IDatabaseProvider {
   getRawConnection(): Database.Database;
   transaction<T>(fn: () => T): T;
   close(): void;
+  reopen(): Database.Database;
+  onCloseOrReopen?(listener: () => void): () => void;
 }
 
 export class DatabaseProvider implements IDatabaseProvider {
   private dbInstance: Database.Database | null = null;
+  private closeOrReopenListeners: Array<() => void> = [];
 
   constructor(private configServiceInstance: IConfigService = configService) {
     // Lazy initialization on first access to ensure Electron runtime paths and environment are ready
   }
 
+  public onCloseOrReopen(listener: () => void): () => void {
+    this.closeOrReopenListeners.push(listener);
+    return () => {
+      this.closeOrReopenListeners = this.closeOrReopenListeners.filter(l => l !== listener);
+    };
+  }
+
+  private notifyCloseOrReopen(): void {
+    for (const listener of this.closeOrReopenListeners) {
+      try {
+        listener();
+      } catch (e) {
+        logger.error('Error in onCloseOrReopen listener', e);
+      }
+    }
+  }
+
   private initialize() {
     try {
       const config = this.configServiceInstance.get();
-      const dbPath = config.dbPath || path.join(process.cwd(), 'dev.db');
+      const dbPath = process.env.TEST_DB_PATH || config.dbPath || path.join(process.cwd(), 'dev.db');
       const dbDir = path.dirname(dbPath);
 
       if (!fs.existsSync(dbDir)) {
@@ -49,7 +69,7 @@ export class DatabaseProvider implements IDatabaseProvider {
   }
 
   public getRawConnection(): Database.Database {
-    if (!this.dbInstance) {
+    if (!this.dbInstance || !this.dbInstance.open) {
       this.initialize();
     }
     return this.dbInstance!;
@@ -76,10 +96,13 @@ export class DatabaseProvider implements IDatabaseProvider {
 
   public reopen(): Database.Database {
     this.close();
-    return this.getRawConnection();
+    const conn = this.getRawConnection();
+    this.notifyCloseOrReopen();
+    return conn;
   }
 
   public close() {
+    this.notifyCloseOrReopen();
     if (this.dbInstance) {
       try {
         try {

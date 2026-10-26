@@ -23,6 +23,7 @@ interface CartState {
     refrigerator_stock_id?: number | null;
   }) => Promise<void>;
   updateItemQuantity: (itemId: number, quantityGrams: number | null, quantityUnits: number | null) => Promise<void>;
+  updateItemRate: (itemId: number, ratePaise: number, reason?: string) => Promise<void>;
   updateItemManualAllocations: (itemId: number, allocations: any[]) => void;
   removeItem: (itemId: number) => Promise<void>;
   holdInvoice: () => Promise<void>;
@@ -123,6 +124,12 @@ export const useCart = create<CartState>((set, get) => ({
   updateItemQuantity: async (itemId, quantityGrams, quantityUnits) => {
     set(() => ({ isLoading: true }));
     const data = await invokeIPC(IPC_CHANNELS.BILLING.UPDATE_ITEM_QTY, { item_id: itemId, quantity_grams: quantityGrams, quantity_units: quantityUnits });
+    applyInvoiceData(set, data);
+  },
+
+  updateItemRate: async (itemId, ratePaise, reason) => {
+    set(() => ({ isLoading: true }));
+    const data = await invokeIPC(IPC_CHANNELS.BILLING.UPDATE_ITEM_RATE, { item_id: itemId, rate_paise: ratePaise, reason });
     applyInvoiceData(set, data);
   },
 

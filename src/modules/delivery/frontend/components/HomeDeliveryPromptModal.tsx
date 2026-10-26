@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Truck, X, ArrowRight, User, Phone, MapPin } from 'lucide-react';
-import type { InvoiceDetail } from '../../../billing/types/billing.types';
+import type { InvoiceDetail } from '../../../billing/frontend/types/billing.types';
 
 interface HomeDeliveryPromptModalProps {
   isOpen: boolean;

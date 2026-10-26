@@ -6,9 +6,11 @@ interface StockAdjustmentModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialVariantId?: number | null;
+  preselectedVariantId?: number | null;
+  onSuccess?: () => void;
 }
 
-export default function StockAdjustmentModal({ isOpen, onClose, initialVariantId }: StockAdjustmentModalProps) {
+export default function StockAdjustmentModal({ isOpen, onClose, initialVariantId, preselectedVariantId, onSuccess }: StockAdjustmentModalProps) {
   const { data: stocks } = useStockStatus();
   const adjustMutation = useAdjustStock();
 
@@ -18,14 +20,16 @@ export default function StockAdjustmentModal({ isOpen, onClose, initialVariantId
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
+  const effectiveVariantId = initialVariantId ?? preselectedVariantId;
+
   useEffect(() => {
     if (isOpen) {
       setError(null);
       setSuccess(false);
       setAdjustQty('');
       setAdjustReason('');
-      if (initialVariantId) {
-        setSelectedVariantId(String(initialVariantId));
+      if (effectiveVariantId) {
+        setSelectedVariantId(String(effectiveVariantId));
       } else if (stocks && stocks.length > 0) {
         setSelectedVariantId(String(stocks[0].product_variant_id));
       }

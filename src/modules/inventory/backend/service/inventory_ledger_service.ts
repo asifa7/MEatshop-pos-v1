@@ -7,8 +7,11 @@ import { logger, auditLogger } from '../../../../core/backend/logger';
 
 export type InventoryActionType = 
   | 'PURCHASE'
+  | 'PURCHASE_REVERSAL'
+  | 'PURCHASE_RETURN'
   | 'SALE'
   | 'SALE_RETURN'
+  | 'SALE_REVERSAL'
   | 'STOCK_ADJUSTMENT'
   | 'TRANSFER'
   | 'TRANSFER_RETURN'
@@ -94,36 +97,40 @@ export class InventoryLedgerService {
     }
 
     const isWeight = variant.unit_type === 'weight' || variant.unit_type === 'live_dual';
-    const isTracked = variant.is_inventory_tracked !== 0;
+    const isTracked = (variant.is_inventory_tracked !== 0) && (variant.track_in_inventory !== 0);
 
-    // Determine current balance from stock_ledger
-    let currentGrams = 0;
-    let currentUnits = 0;
+    // Determine current balance directly from inventory_ledger (Single Source of Truth)
+    const sumRow = db.prepare(`
+      SELECT 
+        SUM(COALESCE(quantity_grams, 0)) as sum_grams,
+        SUM(COALESCE(quantity_units, 0)) as sum_units
+      FROM inventory_ledger 
+      WHERE product_variant_id = ? AND branch_id = ?
+    `).get(variantId, branchId) as any;
+
+    let currentGrams = isWeight ? (sumRow?.sum_grams ?? 0) : 0;
+    let currentUnits = !isWeight ? (sumRow?.sum_units ?? 0) : 0;
 
     const stockRow = db.prepare(`
-      SELECT quantity_grams, quantity_units 
+      SELECT id 
       FROM stock_ledger 
       WHERE product_variant_id = ? AND (location_id = ? OR location_id IS NULL)
       LIMIT 1
     `).get(variantId, branchId) as any;
 
-    if (stockRow) {
-      currentGrams = stockRow.quantity_grams ?? 0;
-      currentUnits = stockRow.quantity_units ?? 0;
-    }
 
     // Determine signed delta based on canonical action type
     const actionNormalized = input.action_type.toUpperCase();
     let deltaGrams: number | null = null;
     let deltaUnits: number | null = null;
 
-    const rawGrams = input.quantity_grams !== undefined && input.quantity_grams !== null ? input.quantity_grams : null;
-    const rawUnits = input.quantity_units !== undefined && input.quantity_units !== null ? input.quantity_units : null;
+    const rawGrams = input.quantity_grams !== undefined && input.quantity_grams !== null ? Math.round(input.quantity_grams) : null;
+    const rawUnits = input.quantity_units !== undefined && input.quantity_units !== null ? Math.round(input.quantity_units) : null;
 
     if (isWeight && rawGrams !== null) {
-      if (['PURCHASE', 'TRANSFER_IN', 'YIELD_IN', 'OTHER_IN', 'FRIDGE_RETURN'].includes(actionNormalized)) {
+      if (['PURCHASE', 'TRANSFER_IN', 'YIELD_IN', 'OTHER_IN', 'FRIDGE_RETURN', 'SALE_REVERSAL'].includes(actionNormalized)) {
         deltaGrams = Math.abs(rawGrams);
-      } else if (['SALE', 'TRANSFER_OUT', 'TRANSFER', 'YIELD_OUT', 'WASTAGE', 'DAMAGE', 'FRIDGE_OUT', 'OTHER_OUT'].includes(actionNormalized)) {
+      } else if (['SALE', 'TRANSFER_OUT', 'TRANSFER', 'YIELD_OUT', 'WASTAGE', 'DAMAGE', 'FRIDGE_OUT', 'OTHER_OUT', 'PURCHASE_REVERSAL', 'PURCHASE_RETURN'].includes(actionNormalized)) {
         deltaGrams = -Math.abs(rawGrams);
       } else if (['SALE_RETURN', 'RETURN'].includes(actionNormalized)) {
         // Return is an inflow if restored
@@ -133,9 +140,9 @@ export class InventoryLedgerService {
         deltaGrams = rawGrams;
       }
     } else if (!isWeight && rawUnits !== null) {
-      if (['PURCHASE', 'TRANSFER_IN', 'YIELD_IN', 'OTHER_IN', 'FRIDGE_RETURN'].includes(actionNormalized)) {
+      if (['PURCHASE', 'TRANSFER_IN', 'YIELD_IN', 'OTHER_IN', 'FRIDGE_RETURN', 'SALE_REVERSAL'].includes(actionNormalized)) {
         deltaUnits = Math.abs(rawUnits);
-      } else if (['SALE', 'TRANSFER_OUT', 'TRANSFER', 'YIELD_OUT', 'WASTAGE', 'DAMAGE', 'FRIDGE_OUT', 'OTHER_OUT'].includes(actionNormalized)) {
+      } else if (['SALE', 'TRANSFER_OUT', 'TRANSFER', 'YIELD_OUT', 'WASTAGE', 'DAMAGE', 'FRIDGE_OUT', 'OTHER_OUT', 'PURCHASE_REVERSAL', 'PURCHASE_RETURN'].includes(actionNormalized)) {
         deltaUnits = -Math.abs(rawUnits);
       } else if (['SALE_RETURN', 'RETURN'].includes(actionNormalized)) {
         deltaUnits = Math.abs(rawUnits);
@@ -147,6 +154,15 @@ export class InventoryLedgerService {
     // Compute new running balance
     const newRunningGrams = isWeight ? (currentGrams + (deltaGrams || 0)) : null;
     const newRunningUnits = !isWeight ? (currentUnits + (deltaUnits || 0)) : null;
+
+    // Check negative stock policy
+    const policyRow = db.prepare("SELECT value FROM system_settings WHERE key = 'negative_stock_policy'").get() as { value: string } | undefined;
+    const negativePolicy = policyRow?.value || 'warn';
+    if (negativePolicy === 'block' && isTracked) {
+      if ((isWeight && newRunningGrams !== null && newRunningGrams < 0) || (!isWeight && newRunningUnits !== null && newRunningUnits < 0)) {
+        throw new ValidationError(`Transaction blocked: Stock on hand for ${variant.prod_name} (${variant.variant_name}) cannot fall below zero under current policy.`);
+      }
+    }
 
     // Determine unit cost
     let unitCostPaise = input.unit_cost_paise ?? 0;
@@ -308,6 +324,31 @@ export class InventoryLedgerService {
   }
 
   /**
+   * Derives stock on hand strictly as the SUM of movements from inventory_ledger.
+   */
+  public getStockOnHand(productVariantId: number, branchId: number = 1): {
+    quantity_grams: number | null;
+    quantity_units: number | null;
+  } {
+    const variant = db.prepare('SELECT pv.*, p.unit_type FROM product_variants pv JOIN products p ON pv.product_id = p.id WHERE pv.id = ?').get(productVariantId) as any;
+    if (!variant) throw new NotFoundError(`Variant #${productVariantId} not found`);
+
+    const isWeight = variant.unit_type === 'weight' || variant.unit_type === 'live_dual';
+    const sumRow = db.prepare(`
+      SELECT 
+        SUM(COALESCE(quantity_grams, 0)) as sum_grams,
+        SUM(COALESCE(quantity_units, 0)) as sum_units
+      FROM inventory_ledger
+      WHERE product_variant_id = ? AND branch_id = ?
+    `).get(productVariantId, branchId) as any;
+
+    return {
+      quantity_grams: isWeight ? (sumRow?.sum_grams ?? 0) : null,
+      quantity_units: !isWeight ? (sumRow?.sum_units ?? 0) : null,
+    };
+  }
+
+  /**
    * Compatibility wrapper for recordEntry
    */
   public recordEntry(input: InventoryLedgerEntryInput): number {
@@ -431,7 +472,7 @@ export class InventoryLedgerService {
       FROM product_variants pv
       JOIN products p ON p.id = pv.product_id
       LEFT JOIN stock_ledger sl ON sl.product_variant_id = pv.id
-      WHERE pv.is_active = 1 AND p.is_active = 1 AND p.is_inventory_tracked = 1
+      WHERE pv.is_active = 1 AND p.is_active = 1 AND COALESCE(pv.track_in_inventory, 1) = 1 AND COALESCE(p.is_inventory_tracked, 1) = 1
     `;
 
     const params: any[] = [];

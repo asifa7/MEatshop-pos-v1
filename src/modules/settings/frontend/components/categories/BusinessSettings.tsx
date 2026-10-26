@@ -109,7 +109,7 @@ export const BusinessSettings: React.FC = () => {
                 shopInfo: { ...prev.shopInfo, gstin: val.toUpperCase() },
               }))
             }
-            placeholder="29AAAAA0000A1Z5"
+            placeholder="e.g. 29AAAAA0000A1Z5 (Optional - leave blank if not registered)"
             className="w-72 font-mono uppercase"
           />
         </SettingRow>
@@ -127,7 +127,7 @@ export const BusinessSettings: React.FC = () => {
                 business: { ...(prev.business || {}), pan: val.toUpperCase() },
               }))
             }
-            placeholder="ABCDE1234F"
+            placeholder="e.g. ABCDE1234F (Optional)"
             className="w-72 font-mono uppercase"
           />
         </SettingRow>

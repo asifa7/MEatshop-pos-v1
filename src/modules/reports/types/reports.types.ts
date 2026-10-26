@@ -141,11 +141,13 @@ export interface ReportQueryResult {
   columns: ReportColumnDefinition[];
   rows: any[];
   groupedData?: ReportGroupSummary[];
-  grandTotals: Record<string, number>;
+  grandTotals: Record<string, any>;
   totalRows: number;
   page: number;
   pageSize: number;
   totalPages: number;
+  productBreakdown?: any[];
+  paymentBreakdown?: any[];
   kpiSummary?: {
     totalTransactions: number;
     totalRevenuePaise: number;

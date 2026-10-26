@@ -74,7 +74,7 @@ export class PhysicalAuditService {
       FROM product_variants pv
       JOIN products p ON pv.product_id = p.id
       LEFT JOIN stock_ledger sl ON sl.product_variant_id = pv.id
-      WHERE pv.is_active = 1 AND p.is_active = 1 AND p.is_inventory_tracked = 1
+      WHERE pv.is_active = 1 AND p.is_active = 1 AND COALESCE(pv.track_in_inventory, 1) = 1 AND COALESCE(p.is_inventory_tracked, 1) = 1
     `).all() as any[];
 
     const insertItemStmt = db.prepare(`

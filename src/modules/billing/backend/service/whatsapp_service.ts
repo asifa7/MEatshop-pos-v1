@@ -540,8 +540,14 @@ export const whatsAppService = {
     customPhone?: string
   ): Promise<{ success: boolean; phone?: string; billText?: string; messageId?: string; failureReason?: string }> {
     try {
+      if (!invoiceId) {
+        return {
+          success: false,
+          failureReason: 'Valid invoice ID is required to send WhatsApp bill',
+        };
+      }
       const invoice = invoiceRepository.findById(invoiceId);
-      if (!invoice) throw new Error('Invoice not found');
+      if (!invoice) throw new Error(`Invoice #${invoiceId} not found`);
 
       let targetPhone = customPhone?.trim() || '';
       if (!targetPhone && invoice.customer_id) {
@@ -560,6 +566,14 @@ export const whatsAppService = {
 
       let cleanRecipient = targetPhone.replace(/[^0-9]/g, '');
       if (cleanRecipient.length === 10) cleanRecipient = `91${cleanRecipient}`;
+
+      if (cleanRecipient.length < 10) {
+        return {
+          success: false,
+          phone: targetPhone,
+          failureReason: 'Invalid mobile number. Please enter a valid 10-digit mobile number.',
+        };
+      }
 
       // 1. Render the receipt image buffer. Automatic bill delivery must remain
       // image-only so a render failure cannot silently send a different text

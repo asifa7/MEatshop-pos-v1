@@ -17,10 +17,124 @@ import {
 } from '../../types/delivery.types';
 import { addressService } from './address_service';
 import { creditService } from '../../../customers/backend/service/credit_service';
+import { formatQty, formatMoney } from '../../../../core/shared/math';
 
 export class DeliveryService {
   private get db() {
     return db;
+  }
+
+  private getInvoiceItemsSummary(invoiceId: number | null | undefined): string {
+    if (!invoiceId || invoiceId <= 0) return '';
+    try {
+      const items = this.db.prepare(`
+        SELECT 
+          ii.quantity_grams,
+          ii.quantity_units,
+          COALESCE(ii.unit_type, pv.unit_type, p.unit_type, 'weight') as unit_type,
+          p.name as product_name,
+          pv.variant_name
+        FROM invoice_items ii
+        LEFT JOIN product_variants pv ON ii.product_variant_id = pv.id
+        LEFT JOIN products p ON pv.product_id = p.id
+        WHERE ii.invoice_id = ?
+        ORDER BY ii.id ASC
+      `).all(invoiceId) as Array<{
+        quantity_grams: number | null;
+        quantity_units: number | null;
+        unit_type: string;
+        product_name: string | null;
+        variant_name: string | null;
+      }>;
+
+      if (!items || items.length === 0) return '';
+
+      return items.map(it => {
+        const pName = (it.product_name || '').trim();
+        const vName = (it.variant_name || '').trim();
+        let displayName = vName || pName || 'Item';
+        if (pName && vName && vName.toLowerCase() !== 'default' && !vName.toLowerCase().includes(pName.toLowerCase())) {
+          displayName = `${pName} (${vName})`;
+        } else if (pName && (!vName || vName.toLowerCase() === 'default')) {
+          displayName = pName;
+        }
+        const isWeight = it.unit_type === 'weight' || it.unit_type === 'live_dual';
+        const qtyStr = isWeight && it.quantity_grams !== null
+          ? formatQty(it.quantity_grams, { fromGrams: true, unit: 'kg', maxDecimals: 3 })
+          : formatQty(it.quantity_units ?? 0, { unit: 'pcs', maxDecimals: 0 });
+        return `${displayName} × ${qtyStr}`;
+      }).join(', ');
+    } catch {
+      return '';
+    }
+  }
+
+  /** Resolve a real customer row for a delivery, including walk-in orders. */
+  private resolveDeliveryCustomerId(
+    requestedCustomerId: number | null | undefined,
+    customerPhone: string,
+    userId: number,
+  ): number {
+    const requestedId = Number(requestedCustomerId);
+    if (Number.isInteger(requestedId) && requestedId > 0) {
+      const existing = this.db
+        .prepare('SELECT id FROM customers WHERE id = ? LIMIT 1')
+        .get(requestedId) as { id: number } | undefined;
+      if (existing) return existing.id;
+    }
+
+    const normalizedPhone = customerPhone.trim();
+    if (normalizedPhone) {
+      const existingByPhone = this.db.prepare(`
+        SELECT id
+        FROM customers
+        WHERE phone = ? OR phone2 = ? OR whatsapp = ?
+        ORDER BY id ASC
+        LIMIT 1
+      `).get(normalizedPhone, normalizedPhone, normalizedPhone) as { id: number } | undefined;
+      if (existingByPhone) return existingByPhone.id;
+    }
+
+    const walkIn = this.db
+      .prepare('SELECT id FROM customers WHERE customer_code = ? LIMIT 1')
+      .get('CUST-WALKIN') as { id: number } | undefined;
+    if (walkIn) return walkIn.id;
+
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO customers (
+        customer_code, name, category, status, is_active, credit_allowed,
+        credit_limit_paise, outstanding_balance_paise, advance_balance_paise,
+        opening_balance_paise, preferred_payment_method, price_tier,
+        discount_percent, created_by, updated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'CUST-WALKIN',
+      'Walk-in Customer',
+      'Retail',
+      'active',
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      'cash',
+      'standard',
+      0,
+      userId,
+      userId,
+    );
+
+    const created = result.lastInsertRowid
+      ? { id: Number(result.lastInsertRowid) }
+      : this.db
+        .prepare('SELECT id FROM customers WHERE customer_code = ? LIMIT 1')
+        .get('CUST-WALKIN') as { id: number } | undefined;
+
+    if (!created) {
+      throw new Error('Unable to create or find the system walk-in customer.');
+    }
+    return created.id;
   }
 
   // ─── 1. State Machine Transition Validation ──────────────────────────────────
@@ -75,14 +189,21 @@ export class DeliveryService {
   // ─── 2. Delivery Order Generation (Flow A & Flow B) ──────────────────────────
   public createDeliveryOrder(input: CreateDeliveryInput, userId: number = 1): DeliveryOrder {
     return this.db.transaction(() => {
-      // 1. Resolve Customer ID (fallback to customer 1 for walk-ins)
-      let customerId = input.customer_id;
-      if (!customerId || customerId <= 0) {
-        customerId = 1;
+      const validUser = this.db
+        .prepare('SELECT id FROM users WHERE id = ? LIMIT 1')
+        .get(userId) as { id: number } | undefined;
+      if (!validUser) {
+        const fallbackUser = this.db
+          .prepare('SELECT id FROM users WHERE is_active = 1 ORDER BY id LIMIT 1')
+          .get() as { id: number } | undefined;
+        if (!fallbackUser) throw new Error('Cannot create delivery ticket: no active user exists.');
+        userId = fallbackUser.id;
       }
 
       let customerName = (input.customer_name ?? '').trim();
       let customerPhone = (input.customer_phone ?? '').trim();
+      // 1. Resolve a valid customer row without assuming that id 1 exists.
+      let customerId = this.resolveDeliveryCustomerId(input.customer_id, customerPhone, userId);
       let deliveryAddressSnapshot = (input.delivery_address_snapshot || input.delivery_notes || input.customer_notes || '').trim();
 
       // If customerId is a specific customer (> 1) and details were not provided, lookup from customer table
@@ -97,7 +218,7 @@ export class DeliveryService {
       }
 
       // 1b. Resolve or create customer address
-      let addressId = input.customer_address_id;
+      let addressId: number | null | undefined = input.customer_address_id;
       if (!addressId && input.new_address && input.new_address.area && input.new_address.pincode) {
         try {
           const savedAddress = addressService.createAddress({
@@ -115,9 +236,21 @@ export class DeliveryService {
         } catch (e) {}
       }
 
+      // A stale address id must not break the delivery insert.
+      if (addressId) {
+        const validAddress = this.db.prepare(`
+          SELECT id FROM customer_addresses WHERE id = ? AND customer_id = ? LIMIT 1
+        `).get(addressId, customerId) as { id: number } | undefined;
+        if (!validAddress) addressId = null;
+      }
+
       // 2. Resolve Zone & Calculate Delivery Fee
       const zone = input.zone_id ? this.getZoneById(input.zone_id) : this.getDefaultZone();
-      const zoneId = zone?.id || 1;
+      let zoneId = zone?.id || null;
+      if (zoneId) {
+        const zoneExists = this.db.prepare('SELECT id FROM delivery_zones WHERE id = ? LIMIT 1').get(zoneId);
+        if (!zoneExists) zoneId = null;
+      }
 
       // 3. Resolve Invoice & Payment Breakdown
       let invoiceId = input.invoice_id;
@@ -127,6 +260,21 @@ export class DeliveryService {
       let amountPaidNowPaise = input.amount_paid_now_paise !== undefined ? input.amount_paid_now_paise : 0;
       let amountPendingPaise = input.amount_pending_paise !== undefined ? input.amount_pending_paise : 0;
       let detectedPaymentMethod = input.payment_method || 'cash';
+
+      if (!invoiceId || invoiceId <= 0) {
+        throw new Error('Cannot create delivery ticket: invoice is missing.');
+      }
+
+      const invoiceExists = this.db
+        .prepare('SELECT id FROM invoices WHERE id = ? LIMIT 1')
+        .get(invoiceId) as { id: number } | undefined;
+      if (!invoiceExists) {
+        throw new Error(`Cannot create delivery ticket: invoice #${invoiceId} was not found.`);
+      }
+
+      const driverId = input.driver_id
+        ? (this.db.prepare('SELECT id FROM delivery_drivers WHERE id = ? LIMIT 1').get(input.driver_id) ? input.driver_id : null)
+        : null;
 
       if (invoiceId) {
         try {
@@ -255,7 +403,7 @@ export class DeliveryService {
         deliveryAddressSnapshot,
         addressId || null,
         zoneId,
-        input.driver_id || null,
+        driverId,
         deliveryType,
         priority,
         initialStatus,
@@ -314,7 +462,7 @@ export class DeliveryService {
         `).run(
           deliveryId,
           null,
-          input.driver_id ? 'assigned' : 'pending',
+          driverId ? 'assigned' : 'pending',
           userId,
           'Delivery order created',
           `Linked to Invoice #${invoiceNumber || invoiceId}`
@@ -322,11 +470,11 @@ export class DeliveryService {
       } catch (e) {}
 
       // 9. Update driver status if assigned
-      if (input.driver_id) {
+      if (driverId) {
         try {
           this.db.prepare(`
             UPDATE delivery_drivers SET status = 'assigned', updated_at = CURRENT_TIMESTAMP WHERE id = ?
-          `).run(input.driver_id);
+          `).run(driverId);
         } catch (e) {}
       }
 
@@ -375,16 +523,23 @@ export class DeliveryService {
         if (dispatchedAt) {
           actualDeliveryMinutes = Math.max(1, Math.round((new Date(now).getTime() - new Date(dispatchedAt).getTime()) / 60000));
         }
+      } else if (newStatus === 'pending' || newStatus === 'out_for_delivery') {
+        deliveredAt = null;
       }
 
       if (newStatus === 'cancelled') {
         cancelledAt = now;
       }
 
+      const deliveredFlag = newStatus === 'delivered' ? 1 : 0;
+      const deliveredBy = newStatus === 'delivered' ? userId : null;
+
       // Update Delivery Record
       this.db.prepare(`
         UPDATE deliveries SET
           status = ?,
+          delivered = ?,
+          delivered_by = ?,
           dispatched_at = ?,
           delivered_at = ?,
           cancelled_at = ?,
@@ -394,6 +549,8 @@ export class DeliveryService {
         WHERE id = ?
       `).run(
         newStatus,
+        deliveredFlag,
+        deliveredBy,
         dispatchedAt || null,
         deliveredAt || null,
         cancelledAt || null,
@@ -687,9 +844,11 @@ export class DeliveryService {
     const address = row.customer_address_id ? addressService.getAddressById(row.customer_address_id) : null;
     const attempts = this.getDeliveryAttempts(id);
     const history = this.getDeliveryHistory(id);
+    const itemsSummary = this.getInvoiceItemsSummary(row.invoice_id) || row.special_prep_instructions || '';
 
     return {
       ...row,
+      items_summary: itemsSummary,
       address,
       attempts,
       status_history: history
@@ -761,43 +920,47 @@ export class DeliveryService {
       params.push(filters.priority);
     }
     if (filters.startDate) {
-      sql += ' AND d.requested_date >= ?';
+      sql += " AND COALESCE(NULLIF(d.requested_date, ''), DATE(d.created_at)) >= ?";
       params.push(filters.startDate);
     }
     if (filters.endDate) {
-      sql += ' AND d.requested_date <= ?';
+      sql += " AND COALESCE(NULLIF(d.requested_date, ''), DATE(d.created_at)) <= ?";
       params.push(filters.endDate);
     }
     if (filters.searchTerm) {
-      sql += ' AND (d.delivery_number LIKE ? OR d.customer_name LIKE ? OR c.name LIKE ? OR d.customer_phone LIKE ? OR c.phone LIKE ? OR inv.invoice_number LIKE ? OR d.delivery_address_snapshot LIKE ?)';
+      sql += ' AND (d.delivery_number LIKE ? OR d.customer_name LIKE ? OR c.name LIKE ? OR d.customer_phone LIKE ? OR c.phone LIKE ? OR inv.invoice_number LIKE ? OR d.delivery_address_snapshot LIKE ? OR CAST(d.id AS TEXT) LIKE ?)';
       const term = `%${filters.searchTerm}%`;
-      params.push(term, term, term, term, term, term, term);
+      params.push(term, term, term, term, term, term, term, term);
     }
 
     sql += " ORDER BY (d.priority = 'urgent') DESC, (d.priority = 'high') DESC, d.created_at DESC LIMIT 200";
 
     const rows = this.db.prepare(sql).all(...params) as any[];
 
-    return rows.map(r => ({
-      ...r,
-      delivery_address_snapshot: r.delivery_address_snapshot || (r.address_area ? `${r.door_no || ''} ${r.building || ''} ${r.street || ''} ${r.address_area}`.trim() : ''),
-      address: r.customer_address_id ? {
-        id: r.customer_address_id,
-        customer_id: r.customer_id,
-        label: r.address_label || 'Home',
-        door_no: r.door_no,
-        building: r.building,
-        street: r.street,
-        area: r.address_area || '',
-        landmark: r.landmark,
-        city: r.city || 'Bengaluru',
-        state: 'Karnataka',
-        pincode: r.pincode || '',
-        latitude: r.latitude,
-        longitude: r.longitude,
-        is_default: 0,
-      } : null
-    }));
+    return rows.map(r => {
+      const itemsSummary = this.getInvoiceItemsSummary(r.invoice_id) || r.special_prep_instructions || '';
+      return {
+        ...r,
+        items_summary: itemsSummary,
+        delivery_address_snapshot: r.delivery_address_snapshot || (r.address_area ? `${r.door_no || ''} ${r.building || ''} ${r.street || ''} ${r.address_area}`.trim() : ''),
+        address: r.customer_address_id ? {
+          id: r.customer_address_id,
+          customer_id: r.customer_id,
+          label: r.address_label || 'Home',
+          door_no: r.door_no,
+          building: r.building,
+          street: r.street,
+          area: r.address_area || '',
+          landmark: r.landmark,
+          city: r.city || 'Bengaluru',
+          state: 'Karnataka',
+          pincode: r.pincode || '',
+          latitude: r.latitude,
+          longitude: r.longitude,
+          is_default: 0,
+        } : null
+      };
+    });
   }
 
   public markDelivered(deliveryId: number, isDelivered: boolean = true, userId: number = 1): DeliveryOrder {
@@ -808,10 +971,8 @@ export class DeliveryService {
       const delivered = isDelivered ? 1 : 0;
       const deliveredAt = isDelivered ? new Date().toISOString() : null;
       const deliveredBy = isDelivered ? userId : null;
-
-      // Both must be true for ticket to fully close
       const isPaid = Boolean(delivery.payment_received === 1 || delivery.payment_status === 'paid');
-      const nextStatus: DeliveryStatus = (delivered === 1 && isPaid) ? 'delivered' : 'pending';
+      const nextStatus: DeliveryStatus = delivered === 1 ? 'delivered' : 'pending';
 
       this.db.prepare(`
         UPDATE deliveries SET
@@ -853,9 +1014,8 @@ export class DeliveryService {
       const paymentStatus = isPaid ? 'paid' : ((delivery.amount_pending_paise || 0) > 0 ? ((delivery.amount_paid_now_paise || 0) > 0 ? 'partial' : 'unpaid') : 'cod_pending');
       const collected = isPaid ? (delivery.total_paise || delivery.cod_expected_paise || 0) : 0;
 
-      // Both must be true for ticket to fully close
       const isDelivered = Boolean(delivery.delivered === 1 || delivery.status === 'delivered');
-      const nextStatus: DeliveryStatus = (isDelivered && paymentReceived === 1) ? 'delivered' : 'pending';
+      const nextStatus: DeliveryStatus = isDelivered ? 'delivered' : (delivery.status || 'pending');
 
       const pendingPaise = delivery.amount_pending_paise || 0;
       let newAmountPaidNow = delivery.amount_paid_now_paise || 0;

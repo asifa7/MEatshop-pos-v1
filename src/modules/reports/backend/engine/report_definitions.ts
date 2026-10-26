@@ -2,6 +2,106 @@ import { ReportDefinition } from '../../types/reports.types';
 
 export const reportDefinitionsRegistry: ReportDefinition[] = [
   // ==========================================================================
+  // CORE ENTERPRISE MODULAR REPORTS (Direct IDs)
+  // ==========================================================================
+  {
+    id: 'sales',
+    name: 'Sales Report',
+    description: 'Summary and itemized report of all completed sales, bills, items, and tender breakdown',
+    dataSource: 'sales_transactions',
+    category: 'sales',
+    availableDimensions: [
+      'invoice_id', 'invoice_number', 'invoice_date', 'invoice_time', 'completed_at',
+      'customer_id', 'customer_name', 'customer_phone', 'customer_category',
+      'product_id', 'product_name', 'variant_name', 'category', 'payment_method', 'cashier_name'
+    ],
+    availableMeasures: [
+      'quantity', 'weight_kg', 'selling_price_paise', 'gross_amount_paise', 'discount_paise',
+      'net_amount_paise', 'cost_paise', 'gross_profit_paise', 'margin_percent'
+    ],
+    defaultColumns: [
+      { id: 'invoice_number', label: 'Bill No', visible: true, width: 130, pinned: true },
+      { id: 'invoice_date', label: 'Date', visible: true, width: 105 },
+      { id: 'invoice_time', label: 'Time', visible: true, width: 85 },
+      { id: 'customer_name', label: 'Customer', visible: true, width: 160 },
+      { id: 'payment_method', label: 'Mode', visible: true, width: 100 },
+      { id: 'product_name', label: 'Items', visible: true, width: 200 },
+      { id: 'net_amount_paise', label: 'Total', visible: true, width: 120 }
+    ],
+    defaultSortBy: [{ field: 'completed_at', direction: 'desc' }],
+    pageSize: 50,
+  },
+  {
+    id: 'purchases',
+    name: 'Purchases Report',
+    description: 'Summary of supplier purchase invoices, goods received, total, paid, and outstanding balances',
+    dataSource: 'purchase_transactions',
+    category: 'operations',
+    availableDimensions: [
+      'purchase_id', 'purchase_invoice_number', 'purchase_date', 'supplier_id', 'supplier_name', 'payment_status'
+    ],
+    availableMeasures: [
+      'total_amount_paise', 'paid_amount_paise', 'balance_paise'
+    ],
+    defaultColumns: [
+      { id: 'purchase_date', label: 'Date', visible: true, width: 110 },
+      { id: 'supplier_name', label: 'Supplier', visible: true, width: 180 },
+      { id: 'purchase_invoice_number', label: 'Ref', visible: true, width: 130 },
+      { id: 'total_amount_paise', label: 'Total', visible: true, width: 120 },
+      { id: 'paid_amount_paise', label: 'Paid', visible: true, width: 120 },
+      { id: 'balance_paise', label: 'Balance', visible: true, width: 120 }
+    ],
+    defaultSortBy: [{ field: 'purchase_date', direction: 'desc' }],
+    pageSize: 50,
+  },
+  {
+    id: 'delivery',
+    name: 'Delivery Operations Report',
+    description: 'Order fulfillment, COD collections, dispatch status, and driver assignments',
+    dataSource: 'delivery_operations',
+    category: 'operations',
+    availableDimensions: [
+      'delivery_id', 'delivery_number', 'requested_date', 'customer_name', 'driver_name', 'status', 'payment_method'
+    ],
+    availableMeasures: [
+      'subtotal_paise', 'delivery_charge_paise', 'total_paise', 'cod_collected_paise'
+    ],
+    defaultColumns: [
+      { id: 'requested_date', label: 'Date', visible: true, width: 110 },
+      { id: 'delivery_number', label: 'Bill / Order #', visible: true, width: 140 },
+      { id: 'customer_name', label: 'Customer', visible: true, width: 160 },
+      { id: 'status', label: 'Status', visible: true, width: 120 },
+      { id: 'total_paise', label: 'Amount', visible: true, width: 120 },
+      { id: 'cod_collected_paise', label: 'Collected', visible: true, width: 120 }
+    ],
+    defaultSortBy: [{ field: 'requested_date', direction: 'desc' }],
+    pageSize: 50,
+  },
+  {
+    id: 'inventory',
+    name: 'Inventory Valuation & Movement Report',
+    description: 'Product stock on hand, opening, goods in, sales out, wastage, closing, and inventory value',
+    dataSource: 'stock_on_hand',
+    category: 'inventory',
+    availableDimensions: [
+      'product_id', 'product_name', 'variant_name', 'category', 'sku'
+    ],
+    availableMeasures: [
+      'quantity_on_hand', 'weight_kg', 'valuation_paise'
+    ],
+    defaultColumns: [
+      { id: 'product_name', label: 'Product', visible: true, width: 200 },
+      { id: 'opening', label: 'Opening', visible: true, width: 100 },
+      { id: 'in', label: 'In', visible: true, width: 100 },
+      { id: 'out', label: 'Out', visible: true, width: 100 },
+      { id: 'wastage', label: 'Wastage', visible: true, width: 100 },
+      { id: 'closing', label: 'Closing', visible: true, width: 100 },
+      { id: 'valuation_paise', label: 'Value', visible: true, width: 120 }
+    ],
+    defaultSortBy: [{ field: 'product_name', direction: 'asc' }],
+    pageSize: 50,
+  },
+  // ==========================================================================
   // MASTER TRANSACTION REPORT
   // ==========================================================================
   {
@@ -1449,5 +1549,9 @@ export function getAllReportDefinitions(): ReportDefinition[] {
 }
 
 export function getReportDefinition(reportId: string): ReportDefinition | undefined {
-  return reportDefinitionsRegistry.find(r => r.id === reportId);
+  if (!reportId) return undefined;
+  const target = reportId.toLowerCase();
+  return reportDefinitionsRegistry.find(
+    r => r.id.toLowerCase() === target || r.id.toLowerCase() === target.replace(/^simple_/, '')
+  );
 }

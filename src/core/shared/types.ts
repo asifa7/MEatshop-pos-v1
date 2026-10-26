@@ -36,6 +36,9 @@ export interface PaymentsConfig {
   defaultPaymentMethod?: 'cash' | 'card' | 'upi' | 'credit' | 'split';
   allowSplit?: boolean;
   allowCredit?: boolean;
+  upiId?: string;
+  upiPayeeName?: string;
+  printUpiQrOnDelivery?: boolean;
 }
 
 export interface CashboxConfig {
@@ -138,6 +141,9 @@ export interface ReceiptTemplateConfig {
   footerCondition1?: string;
   footerCondition2?: string;
   footerCondition3?: string;
+  upiId?: string;
+  upiPayeeName?: string;
+  printUpiQrOnDelivery?: boolean;
   footerMsg1?: string;
   footerMsg2?: string;
   // Manual Ruler, Dead Zone & Position Nudge
@@ -168,6 +174,9 @@ export interface BillingSettingsConfig {
   skipPaymentConfirmation?: boolean;
   enableCalculatorWidget?: boolean;
   defaultPaymentMethod?: 'cash' | 'upi' | 'card' | 'split' | 'credit';
+  autoOpenWhatsAppBill?: boolean;
+  assumeExactCashWhenBlank?: boolean;
+  idleTimeoutHours?: number;
 }
 
 export interface BackupConfig {
@@ -181,6 +190,7 @@ export interface WhatsAppConfig {
   retryBackoffSeconds?: number;
   billCaptionTemplate?: string;
   deliveryMessageTemplate?: string;
+  autoOpenWhatsAppBill?: boolean;
 }
 
 export interface WhatsAppQueueItem {

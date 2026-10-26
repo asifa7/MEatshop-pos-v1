@@ -44,6 +44,11 @@ export interface AdminProduct {
   last_purchase_cost_paise?: number;
   created_at: string;
   updated_at: string;
+  stock_mode?: 'OWN' | 'LINKED' | 'NONE';
+  parent_product_id?: number | null;
+  link_mode?: 'YIELD' | 'PACK' | null;
+  yield_g_per_kg?: number | null;
+  parent_units_per_sale_unit?: number | null;
   variants: AdminProductVariant[];
   hasInvoiceHistory: boolean;
   hasSalesHistory?: boolean;

@@ -148,6 +148,44 @@ export class InventoryService {
         created_by: parsed.data.adjusted_by,
       });
 
+      // 7. If mapped to a live animal, keep live_chicken_batches in sync
+      const animalConfig = db.prepare('SELECT animal_key FROM live_animal_yield_configs WHERE live_variant_id = ?').get(parsed.data.product_variant_id) as any;
+      if (animalConfig?.animal_key) {
+        const animalKey = animalConfig.animal_key;
+        if (deltaGrams && deltaGrams < 0) {
+          let remainingToDeduct = Math.abs(deltaGrams);
+          const batches = db.prepare(`
+            SELECT * FROM live_chicken_batches
+            WHERE animal_type = ? AND status = 'active' AND remaining_weight_grams > 0
+            ORDER BY purchase_date ASC, id ASC
+          `).all(animalKey) as any[];
+
+          for (const b of batches) {
+            if (remainingToDeduct <= 0) break;
+            const deduct = Math.min(b.remaining_weight_grams, remainingToDeduct);
+            const newWeight = b.remaining_weight_grams - deduct;
+            const newStatus = newWeight <= 0 ? 'exhausted' : 'active';
+            db.prepare('UPDATE live_chicken_batches SET remaining_weight_grams = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newWeight, newStatus, b.id);
+            remainingToDeduct -= deduct;
+          }
+          if (remainingToDeduct > 0) {
+            const lastBatch = db.prepare('SELECT id FROM live_chicken_batches WHERE animal_type = ? ORDER BY id DESC LIMIT 1').get(animalKey) as any;
+            if (lastBatch) {
+              db.prepare('UPDATE live_chicken_batches SET remaining_weight_grams = remaining_weight_grams - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(remainingToDeduct, lastBatch.id);
+            }
+          }
+        } else if (deltaGrams && deltaGrams > 0) {
+          const batchNum = `ADJ-INV-${Date.now().toString().slice(-6)}`;
+          db.prepare(`
+            INSERT INTO live_chicken_batches (
+              batch_number, animal_type, supplier_id, purchase_date,
+              cost_per_kg_paise, initial_weight_grams, initial_count,
+              remaining_weight_grams, remaining_count, remaining_count_milli, status, notes
+            ) VALUES (?, ?, 1, CURRENT_TIMESTAMP, 0, ?, ?, ?, ?, ?, 'active', ?)
+          `).run(batchNum, animalKey, deltaGrams, deltaUnits || 0, deltaGrams, deltaUnits || 0, (deltaUnits || 0) * 1000, parsed.data.reason || 'Inventory Adjustment');
+        }
+      }
+
       logger.info('Logged manual stock adjustment and updated ledger', {
         adjustmentId: adjustment.id,
         variantId: parsed.data.product_variant_id,
@@ -242,12 +280,36 @@ export class InventoryService {
           WHERE pv.id = ?
         `).get(parsed.data.product_variant_id) as any;
 
-        const isLiveChicken = (variantRow?.unit_type === 'live_dual' || variantRow?.stock_classification === 'live_yield') &&
-          (variantRow?.category?.toLowerCase().includes('chicken') || variantRow?.product_name?.toLowerCase().includes('chicken'));
+        // Check if this variant is mapped to an animal in live_animal_yield_configs or matches an animal keyword
+        const configRow = db.prepare('SELECT animal_key FROM live_animal_yield_configs WHERE live_variant_id = ?').get(parsed.data.product_variant_id) as { animal_key: string } | undefined;
+        let detectedAnimalKey: string | null = configRow?.animal_key || null;
 
-        if (isLiveChicken) {
+        if (!detectedAnimalKey) {
+          const pName = ((variantRow?.product_name || '') + ' ' + (variantRow?.variant_name || '')).toLowerCase();
+          const pCat = (variantRow?.category || '').toLowerCase();
+          if (pName.includes('mutton') || pCat.includes('mutton')) detectedAnimalKey = 'mutton';
+          else if (pName.includes('country chicken') || pName.includes('cc live') || pCat.includes('country chicken')) detectedAnimalKey = 'country_chicken';
+          else if (pName.includes('quail') || pName.includes('quil') || pCat.includes('quail')) detectedAnimalKey = 'quils';
+          else if (pName.includes('duck')) detectedAnimalKey = 'ducks';
+          else if (pName.includes('rabbit')) detectedAnimalKey = 'rabbit';
+          else if (pName.includes('chicken') || pCat.includes('chicken')) detectedAnimalKey = 'chicken';
+        }
+
+        const isLiveDual = variantRow?.unit_type === 'live_dual';
+        const isLiveClassification = variantRow?.stock_classification === 'live_yield';
+
+        if (detectedAnimalKey && (isLiveDual || isLiveClassification || variantRow?.unit_type === 'weight')) {
           const liveWeightGrams = parsed.data.quantity_grams ?? 0;
-          const countVal = Math.max(1, Math.round((liveWeightGrams || 1600) / 1600));
+          // Estimate count based on animal size if not provided
+          let defaultAnimalWeightG = 1600;
+          if (detectedAnimalKey === 'mutton') defaultAnimalWeightG = 10000;
+          else if (detectedAnimalKey === 'quils') defaultAnimalWeightG = 200;
+          else if (detectedAnimalKey === 'ducks') defaultAnimalWeightG = 2000;
+          else if (detectedAnimalKey === 'rabbit') defaultAnimalWeightG = 2500;
+          else if (detectedAnimalKey === 'country_chicken') defaultAnimalWeightG = 1400;
+
+          const countVal = Math.max(1, Math.round((liveWeightGrams || defaultAnimalWeightG) / defaultAnimalWeightG));
+          const countMilli = countVal * 1000;
           const cleanDate = new Date().toISOString().slice(0, 10).replace(/[^0-9]/g, '');
           const countRow = db.prepare('SELECT COUNT(*) as cnt FROM live_chicken_batches').get() as { cnt: number };
           const seq = String((countRow?.cnt || 0) + 1).padStart(4, '0');
@@ -255,12 +317,13 @@ export class InventoryService {
 
           db.prepare(`
             INSERT INTO live_chicken_batches (
-              batch_number, supplier_id, purchase_date,
+              batch_number, animal_type, supplier_id, purchase_date,
               cost_per_kg_paise, initial_weight_grams, initial_count,
-              remaining_weight_grams, remaining_count, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+              remaining_weight_grams, remaining_count, remaining_count_milli, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
           `).run(
             batchNum,
+            detectedAnimalKey,
             parsed.data.supplier_id,
             new Date().toISOString().slice(0, 10),
             parsed.data.cost_paise,
@@ -268,11 +331,12 @@ export class InventoryService {
             countVal,
             liveWeightGrams,
             countVal,
-            `Direct Purchase #${purchase.id}`
+            countMilli,
+            `Direct Purchase #${purchase.id} (${detectedAnimalKey})`
           );
         }
       } catch (e: any) {
-        logger.warn(`Live chicken batch tracking notice on purchase: ${e.message}`);
+        logger.warn(`Live animal batch tracking notice on purchase: ${e.message}`);
       }
 
       logger.info('Purchase transaction recorded and stock updated', {
@@ -453,6 +517,7 @@ export class InventoryService {
       LEFT JOIN locations loc ON loc.id = sl.location_id
       WHERE 1=1 ${locationClause} ${categoryClause} 
       AND p.is_inventory_tracked = 1
+      AND COALESCE(pv.track_in_inventory, 1) = 1
       AND p.is_active = 1
       ORDER BY p.category ASC, p.name ASC, pv.variant_name ASC
     `;

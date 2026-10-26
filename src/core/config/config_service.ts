@@ -218,11 +218,19 @@ export const BillingSettingsSchema = z.object({
   skipPaymentConfirmation: z.boolean().default(false),
   enableCalculatorWidget: z.boolean().default(true),
   defaultPaymentMethod: z.enum(['cash', 'upi', 'card', 'split', 'credit']).default('cash'),
+  assumeExactCashWhenBlank: z.boolean().default(false),
+  idleTimeoutHours: z.number().default(12),
 });
 
 // Meat Yield Calculation Schema
 export const MeatYieldSchema = z.object({
   defaultChickenYieldRatio: z.number().min(0.1).default(1.60),
+  yieldEnabled: z.boolean().default(true),
+  trackLiverGizzard: z.boolean().default(true),
+  wholeChickenGrams: z.number().min(1).default(625),
+  liverGrams: z.number().min(0).default(30),
+  gizzardGrams: z.number().min(0).default(40),
+  customProductRatios: z.record(z.string(), z.number()).default({}),
 });
 
 // WhatsApp Configuration Schema
@@ -292,16 +300,21 @@ export class ConfigService implements IConfigService {
       userDataPath = process.cwd();
     }
 
-    this.configFilePath = path.join(userDataPath, 'config.json');
+    // Portable Self-Contained Project Support:
+    // If a config.json exists directly in the workspace/project root, use it as primary config.
+    const projectRootConfig = path.join(process.cwd(), 'config.json');
+    if (fs.existsSync(projectRootConfig)) {
+      this.configFilePath = projectRootConfig;
+    } else {
+      this.configFilePath = path.join(userDataPath, 'config.json');
+    }
     this.load(env, userDataPath);
   }
 
   private load(env: 'development' | 'testing' | 'production', userDataPath: string) {
-    const defaultDbPath = env === 'production' 
-      ? path.join(userDataPath, 'data.db') 
-      : path.join(process.cwd(), 'dev.db');
+    const defaultDbPath = path.join(process.cwd(), 'dev.db');
 
-    const defaultBackupDir = path.join(userDataPath, 'backups');
+    const defaultBackupDir = path.join(process.cwd(), 'backups');
 
     const defaults: AppConfig = {
       env,
@@ -475,9 +488,17 @@ export class ConfigService implements IConfigService {
         skipPaymentConfirmation: false,
         enableCalculatorWidget: true,
         defaultPaymentMethod: 'cash',
+        assumeExactCashWhenBlank: false,
+        idleTimeoutHours: 12,
       },
       meatYield: {
         defaultChickenYieldRatio: 1.60,
+        yieldEnabled: true,
+        trackLiverGizzard: true,
+        wholeChickenGrams: 625,
+        liverGrams: 30,
+        gizzardGrams: 40,
+        customProductRatios: {},
       },
       backup: {
         backupDir: defaultBackupDir,

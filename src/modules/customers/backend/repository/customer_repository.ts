@@ -36,6 +36,8 @@ export interface FullCustomerRow {
   preferred_payment_method: string;
   preferred_delivery_time: string | null;
   price_tier: string;
+  manual_tier?: string | null;
+  preferred_time_slot?: string | null;
   discount_percent: number;
   notes: string | null;
   created_by: number | null;
@@ -68,6 +70,8 @@ export interface CreateCustomerInput {
   opening_balance_date?: string | null;
   preferred_payment_method?: string;
   price_tier?: string;
+  manual_tier?: string | null;
+  preferred_time_slot?: string | null;
   discount_percent?: number;
   notes?: string | null;
   created_by?: number | null;
@@ -225,6 +229,8 @@ export class CustomerRepository {
         opening_balance_date   = @opening_balance_date,
         preferred_payment_method = @preferred_payment_method,
         price_tier             = @price_tier,
+        manual_tier            = @manual_tier,
+        preferred_time_slot    = @preferred_time_slot,
         discount_percent       = @discount_percent,
         notes                  = @notes,
         updated_by             = @updated_by,
@@ -255,6 +261,8 @@ export class CustomerRepository {
       opening_balance_date: fields.opening_balance_date !== undefined ? fields.opening_balance_date : existing.opening_balance_date,
       preferred_payment_method: fields.preferred_payment_method ?? existing.preferred_payment_method,
       price_tier: fields.price_tier ?? existing.price_tier,
+      manual_tier: fields.manual_tier !== undefined ? fields.manual_tier : existing.manual_tier,
+      preferred_time_slot: fields.preferred_time_slot !== undefined ? fields.preferred_time_slot : existing.preferred_time_slot,
       discount_percent: fields.discount_percent ?? existing.discount_percent,
       notes: fields.notes !== undefined ? fields.notes : existing.notes,
       updated_by: updatedBy,

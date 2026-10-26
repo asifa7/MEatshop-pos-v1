@@ -75,11 +75,16 @@ export class BaileysWhatsAppService {
   }
 
   private initSessionDir(): void {
+    const localSession = path.join(process.cwd(), 'whatsapp-session');
+    if (fs.existsSync(localSession)) {
+      this.sessionDir = localSession;
+      return;
+    }
     try {
       const userDataPath = app?.getPath ? app.getPath('userData') : process.cwd();
       this.sessionDir = path.join(userDataPath, 'whatsapp-session');
     } catch {
-      this.sessionDir = path.join(process.cwd(), 'whatsapp-session');
+      this.sessionDir = localSession;
     }
   }
 

@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   X, Save, Shield, MapPin, Info, AlertTriangle, 
-  Phone, User, Check, Sparkles, UtensilsCrossed 
+  Phone, User, Check, Sparkles, UtensilsCrossed, Link2
 } from 'lucide-react';
 import { 
   useCreateCustomer, 
@@ -45,6 +45,10 @@ export default function CustomerForm({
   const [email, setEmail] = useState('');
   const [status, setStatus] = useState<'active' | 'inactive' | 'blocked'>('active');
 
+  // Dual-Role Linked Supplier
+  const [linkedSupplierId, setLinkedSupplierId] = useState<string>('');
+  const [suppliersList, setSuppliersList] = useState<Array<{ id: number; code?: string; company_name?: string; name?: string; phone?: string | null }>>([]);
+
   // Address
   const [billingLine1, setBillingLine1] = useState('');
   const [billingLine2, setBillingLine2] = useState('');
@@ -78,6 +82,8 @@ export default function CustomerForm({
   const [priceTier, setPriceTier] = useState<PriceTier>('standard');
   const [discountPercent, setDiscountPercent] = useState('0');
   const [prefDeliveryTime, setPrefDeliveryTime] = useState('');
+  const [manualTier, setManualTier] = useState<string>('auto');
+  const [preferredTimeSlot, setPreferredTimeSlot] = useState<string>('flexible');
 
   // Notes
   const [notes, setNotes] = useState('');
@@ -97,6 +103,37 @@ export default function CustomerForm({
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
+    if (!isOpen) return;
+    window.api.invoke('suppliers:get-all')
+      .then((res: any) => {
+        if (res?.success && Array.isArray(res.data)) {
+          setSuppliersList(res.data);
+        }
+      })
+      .catch(() => {});
+  }, [isOpen]);
+
+  // Detect if customer name or phone matches an unlinked supplier
+  const suggestedSupplier = useMemo(() => {
+    if (linkedSupplierId) return null;
+    const trimmedName = name.trim().toLowerCase();
+    const cleanPhone = phone.replace(/\D/g, '').slice(-10);
+    if (trimmedName.length < 3 && cleanPhone.length < 10) return null;
+    return suppliersList.find((s) => {
+      const sName = (s.company_name || s.name || '').trim().toLowerCase();
+      const sPhone = (s.phone || '').replace(/\D/g, '').slice(-10);
+      if (trimmedName.length >= 3 && sName === trimmedName) return true;
+      if (cleanPhone.length === 10 && sPhone === cleanPhone) return true;
+      return false;
+    }) || null;
+  }, [name, phone, suppliersList, linkedSupplierId]);
+
+  const linkedSupplierObj = useMemo(() => {
+    if (!linkedSupplierId) return null;
+    return suppliersList.find((s) => String(s.id) === String(linkedSupplierId)) || null;
+  }, [linkedSupplierId, suppliersList]);
+
+  useEffect(() => {
     if (customer) {
       setName(customer.name);
       setBusinessName(customer.business_name || '');
@@ -107,6 +144,7 @@ export default function CustomerForm({
       setWhatsapp(customer.whatsapp || '');
       setEmail(customer.email || '');
       setStatus((customer.status as any) || 'active');
+      setLinkedSupplierId((customer as any).linked_supplier_id ? String((customer as any).linked_supplier_id) : '');
 
       setBillingLine1(customer.billing_address_line1 || '');
       setBillingLine2(customer.billing_address_line2 || '');
@@ -145,6 +183,8 @@ export default function CustomerForm({
       setDiscountPercent(String(customer.discount_percent));
       setPrefPayment(customer.preferred_payment_method as PaymentMethodType);
       setPrefDeliveryTime(customer.preferred_delivery_time || '');
+      setManualTier(customer.manual_tier || 'auto');
+      setPreferredTimeSlot(customer.preferred_time_slot || 'flexible');
       setNotes(customer.notes || '');
       setDeliveryNotes(customer.delivery_notes || '');
     } else {
@@ -158,6 +198,7 @@ export default function CustomerForm({
       setWhatsapp('');
       setEmail('');
       setStatus('active');
+      setLinkedSupplierId('');
       setBillingLine1('');
       setBillingLine2('');
       setBillingCity('');
@@ -186,6 +227,8 @@ export default function CustomerForm({
       setDiscountPercent('0');
       setPrefPayment('cash');
       setPrefDeliveryTime('');
+      setManualTier('auto');
+      setPreferredTimeSlot('flexible');
       setNotes('');
       setDeliveryNotes('');
     }
@@ -288,6 +331,7 @@ export default function CustomerForm({
       whatsapp,
       email,
       status,
+      linked_supplier_id: linkedSupplierId ? Number(linkedSupplierId) : null,
       ...billingPayload,
       ...shippingPayload,
       category,
@@ -299,6 +343,8 @@ export default function CustomerForm({
       preferred_payment_method: prefPayment,
       preferred_delivery_time: prefDeliveryTime,
       price_tier: priceTier,
+      manual_tier: manualTier === 'auto' ? null : manualTier,
+      preferred_time_slot: preferredTimeSlot === 'flexible' ? null : preferredTimeSlot,
       discount_percent: parseFloat(discountPercent || '0'),
       preferred_cut: preferredCut,
       skin_preference: skinPreference,
@@ -338,9 +384,19 @@ export default function CustomerForm({
               <User size={20} />
             </div>
             <div>
-              <h3 className="text-base font-extrabold text-text-primary">
-                {customer ? `Edit Profile: ${customer.name}` : 'Create New Customer Account'}
-              </h3>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-base font-extrabold text-text-primary">
+                  {customer ? `Edit Profile: ${customer.name}` : 'Create New Customer Account'}
+                </h3>
+                {linkedSupplierId && (
+                  <span className="px-2.5 py-0.5 bg-indigo-500/15 border border-indigo-500/40 text-indigo-700 dark:text-indigo-300 rounded-full text-[10px] font-extrabold inline-flex items-center gap-1">
+                    <Link2 size={11} />
+                    <span>
+                      🔗 Linked Supplier: {linkedSupplierObj ? (linkedSupplierObj.company_name || linkedSupplierObj.name) : ((customer as any)?.linked_supplier_name || `#${linkedSupplierId}`)}
+                    </span>
+                  </span>
+                )}
+              </div>
               <p className="text-xs text-text-secondary">
                 {customer ? `${customer.customer_code} • Update contact details, cutting preferences & credit` : 'Fill in profile, preferences, and credit account settings'}
               </p>
@@ -387,6 +443,30 @@ export default function CustomerForm({
             </div>
           )}
 
+          {/* Auto-detected Supplier Match Banner */}
+          {suggestedSupplier && (
+            <div className="p-3 bg-indigo-500/10 border border-indigo-500/35 rounded-xl flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 text-xs">
+                <Link2 size={16} className="text-indigo-500 flex-shrink-0" />
+                <div>
+                  <span className="font-extrabold text-indigo-800 dark:text-indigo-300">
+                    Dual-Role Match Found:
+                  </span>{' '}
+                  <span className="text-text-secondary">
+                    Supplier <strong>{suggestedSupplier.company_name || suggestedSupplier.name}</strong> ({suggestedSupplier.code || `#${suggestedSupplier.id}`}) shares the same name/phone.
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLinkedSupplierId(String(suggestedSupplier.id))}
+                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-extrabold whitespace-nowrap cursor-pointer"
+              >
+                🔗 Link Supplier Account
+              </button>
+            </div>
+          )}
+
           {/* TAB 1: BASIC INFO */}
           {activeTab === 'basic' && (
             <div className="space-y-4">
@@ -422,6 +502,39 @@ export default function CustomerForm({
                     <option value="Catering">Catering</option>
                     <option value="Distributor">Distributor</option>
                     <option value="Contract">Contract</option>
+                  </select>
+                </div>
+
+                {/* Customer Tier (Lifecycle Bar / Manual Override) */}
+                <div>
+                  <label className="block text-xs font-bold text-text-secondary mb-1">Customer Tier</label>
+                  <select
+                    value={manualTier}
+                    onChange={(e) => setManualTier(e.target.value)}
+                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3.5 py-2.5 text-sm text-text-primary focus:border-brand-500 focus:outline-none shadow-sm font-medium"
+                  >
+                    <option value="auto">Auto (Move based on purchases)</option>
+                    <option value="vip">⭐ VIP Customer</option>
+                    <option value="regular">🟢 Regular Customer</option>
+                    <option value="new">🆕 New Customer</option>
+                    <option value="rare">⏳ Rare / Infrequent</option>
+                    <option value="wholesale">📦 Wholesale Partner</option>
+                    <option value="restaurant">🍽️ Restaurant / Hotel</option>
+                  </select>
+                </div>
+
+                {/* Usual Store Visit Time Window */}
+                <div>
+                  <label className="block text-xs font-bold text-text-secondary mb-1">Usual Visit Time Window</label>
+                  <select
+                    value={preferredTimeSlot}
+                    onChange={(e) => setPreferredTimeSlot(e.target.value)}
+                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3.5 py-2.5 text-sm text-text-primary focus:border-brand-500 focus:outline-none shadow-sm font-medium"
+                  >
+                    <option value="flexible">Auto (Analyzes Invoice Timestamps)</option>
+                    <option value="morning">🌅 Morning (6 AM - 12 PM)</option>
+                    <option value="afternoon">☀️ Afternoon (12 PM - 5 PM)</option>
+                    <option value="evening">🌙 Evening (5 PM+)</option>
                   </select>
                 </div>
 
@@ -511,6 +624,40 @@ export default function CustomerForm({
                     <option value="inactive">Inactive</option>
                     <option value="blocked">Blocked / Suspended</option>
                   </select>
+                </div>
+
+                {/* Dual-Role Linked Supplier */}
+                <div className="md:col-span-2 bg-indigo-500/5 border border-indigo-500/25 rounded-xl p-3.5">
+                  <label className="block text-xs font-extrabold text-indigo-700 dark:text-indigo-300 mb-1.5 flex items-center gap-1.5">
+                    <Link2 size={14} />
+                    <span>🔗 Linked Supplier Account (Dual-Role Customer + Supplier)</span>
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <select
+                      value={linkedSupplierId}
+                      onChange={(e) => setLinkedSupplierId(e.target.value)}
+                      className="flex-1 bg-surface-card border border-border-subtle rounded-xl px-3.5 py-2 text-xs text-text-primary focus:border-indigo-500 focus:outline-none font-bold"
+                    >
+                      <option value="">— Not Linked to a Supplier —</option>
+                      {suppliersList.map((s) => (
+                        <option key={s.id} value={String(s.id)}>
+                          {s.company_name || s.name} ({s.code || `#${s.id}`}){s.phone ? ` • ${s.phone}` : ''}
+                        </option>
+                      ))}
+                    </select>
+                    {linkedSupplierId && (
+                      <button
+                        type="button"
+                        onClick={() => setLinkedSupplierId('')}
+                        className="px-3 py-2 bg-surface-card hover:bg-red-500/15 border border-border-subtle text-red-500 rounded-xl text-xs font-bold cursor-pointer"
+                      >
+                        Unlink
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-text-muted mt-1">
+                    Link if this customer also supplies goods to your shop (keeps both accounts distinct while cross-linking them).
+                  </p>
                 </div>
 
                 {/* GSTIN */}

@@ -1,771 +1,906 @@
-import { useState, useRef, useEffect, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import React, { useState, useRef, useEffect, useMemo, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
-  X, Save, AlertTriangle, FileSpreadsheet, Plus, RefreshCw, CheckCircle2,
-  Download, Upload, Trash2, Check
+  X,
+  Save,
+  AlertTriangle,
+  FileSpreadsheet,
+  Plus,
+  RefreshCw,
+  CheckCircle2,
+  Download,
+  Upload,
+  Trash2,
+  ClipboardPaste,
 } from 'lucide-react';
-import { useBulkAddProducts } from '../hooks/useProductMutations';
+import { IPC_CHANNELS } from '../../../../core/ipc/channels';
 import { useAdminProducts } from '../hooks/useProducts';
 import { FIXED_CATEGORIES } from '../../types/products.types';
 
-interface BulkProductSheetModalProps {
+export interface BulkProductSheetModalProps {
   isOpen: boolean;
   onClose: () => void;
+  onSuccess?: () => void;
 }
 
-interface PosProductRow {
-  product_code: string;
+export type StandardUnitOption = 'kg' | 'g' | 'pcs' | 'tray' | 'pack';
+
+export interface BulkSheetRow {
   name: string;
   category: string;
-  type: string;
-  unit_type: 'weight' | 'piece' | 'live_dual';
-  cost_rupees: string;
-  price_rupees: string;
-  track_inventory: boolean;
+  unit: StandardUnitOption;
+  buying_rate_rupees: string;
+  selling_rate_rupees: string;
+  product_code: string;
+  track_in_inventory: boolean;
 }
 
-const DEFAULT_CATEGORIES = [...FIXED_CATEGORIES];
-const DEFAULT_TYPES = ['Unprocessed (Raw)', 'Processed (Cut/Minced)'];
-const DEFAULT_UNIT_TYPES = [
-  { value: 'weight', label: '⚖ Weight (kg)' },
-  { value: 'piece', label: '🔢 Piece / Unit' },
-  { value: 'live_dual', label: '🐔 Live Dual' },
+const STANDARD_UNITS: { value: StandardUnitOption; label: string }[] = [
+  { value: 'kg', label: 'kg' },
+  { value: 'g', label: 'g' },
+  { value: 'pcs', label: 'pcs' },
+  { value: 'tray', label: 'tray' },
+  { value: 'pack', label: 'pack' },
 ];
 
-export default function BulkProductSheetModal({ isOpen, onClose }: BulkProductSheetModalProps) {
+const CATEGORIES = FIXED_CATEGORIES?.length
+  ? [...FIXED_CATEGORIES]
+  : ['Chicken', 'Mutton', 'Seafood', 'Eggs', 'Cold Cuts', 'Masalas', 'General'];
+
+const normalizeUnit = (raw?: string): StandardUnitOption => {
+  const s = (raw || '').trim().toLowerCase();
+  if (s === 'g' || s === 'gram' || s === 'grams') return 'g';
+  if (s === 'pcs' || s === 'pc' || s === 'piece' || s === 'pieces' || s === 'unit') return 'pcs';
+  if (s === 'tray' || s === 'trays') return 'tray';
+  if (s === 'pack' || s === 'packet' || s === 'pkt') return 'pack';
+  return 'kg';
+};
+
+export default function BulkProductSheetModal({
+  isOpen,
+  onClose,
+  onSuccess,
+}: BulkProductSheetModalProps) {
   const { data: existingProducts = [] } = useAdminProducts();
-  const bulkAddMutation = useBulkAddProducts();
+  const queryClient = useQueryClient();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [rows, setRows] = useState<PosProductRow[]>([]);
+  const [rows, setRows] = useState<BulkSheetRow[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isPasteBoxOpen, setIsPasteBoxOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [importResult, setImportResult] = useState<{ createdCount: number; updatedCount: number; errorRows: any[] } | null>(null);
+  const [saveSummary, setSaveSummary] = useState<{
+    createdCount: number;
+    updatedCount: number;
+    errorRows: Array<{ rowIndex: number; rowName?: string; messages: string[] }>;
+  } | null>(null);
 
-  // Initialize fresh rows on open
+  // Compute highest existing numeric product code
+  const highestExistingCode = useMemo(() => {
+    let maxCode = 0;
+    for (const p of existingProducts) {
+      if (p.product_code) {
+        const clean = String(p.product_code).replace(/^prd-0*/i, '').replace(/^0+/, '');
+        const num = parseInt(clean, 10);
+        if (!isNaN(num) && num > maxCode) {
+          maxCode = num;
+        }
+      }
+    }
+    return maxCode;
+  }, [existingProducts]);
+
+  // Existing catalogue lookup sets for instant duplicate detection
+  const existingCodeSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of existingProducts) {
+      if (p.product_code) {
+        s.add(String(p.product_code).trim().toLowerCase());
+      }
+    }
+    return s;
+  }, [existingProducts]);
+
+  const existingNameSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of existingProducts) {
+      if (p.name) s.add(p.name.trim().toLowerCase());
+      const vName = (p as any).variant_name;
+      if (vName) s.add(String(vName).trim().toLowerCase());
+    }
+    return s;
+  }, [existingProducts]);
+
+  // Always open EMPTY (8 blank rows ready for entry — NO prefilled dummy/existing items)
   useEffect(() => {
     if (isOpen) {
       setError(null);
-      setImportResult(null);
+      setSaveSummary(null);
+      setIsPasteBoxOpen(false);
+      setPasteText('');
 
-      // Compute starting bill number from existing catalogue
-      let highestNum = 0;
-      existingProducts.forEach(p => {
-        if (p.product_code) {
-          const num = parseInt(p.product_code.replace(/^PRD-0*/, ''), 10);
-          if (!isNaN(num) && num > highestNum) highestNum = num;
-        }
-      });
-
-      const initialRows: PosProductRow[] = Array(6).fill(null).map((_, i) => ({
-        product_code: String(highestNum + i + 1),
+      const blankRows: BulkSheetRow[] = Array.from({ length: 8 }, (_, idx) => ({
         name: '',
-        category: 'Chicken',
-        type: 'Unprocessed (Raw)',
-        unit_type: 'weight',
-        cost_rupees: '',
-        price_rupees: '',
-        track_inventory: false,
+        category: CATEGORIES[0] || 'Chicken',
+        unit: 'kg',
+        buying_rate_rupees: '',
+        selling_rate_rupees: '',
+        product_code: String(highestExistingCode + idx + 1),
+        track_in_inventory: true,
       }));
-
-      setRows(initialRows);
+      setRows(blankRows);
     }
-  }, [isOpen, existingProducts]);
+  }, [isOpen, highestExistingCode]);
+
+  // Row-level validation map
+  const rowValidations = useMemo(() => {
+    const codeCounts = new Map<string, number>();
+    const nameCounts = new Map<string, number>();
+
+    rows.forEach((r) => {
+      const hasContent =
+        r.name.trim() !== '' ||
+        r.buying_rate_rupees.trim() !== '' ||
+        r.selling_rate_rupees.trim() !== '';
+      if (!hasContent) return;
+
+      const c = r.product_code.trim().toLowerCase();
+      if (c) codeCounts.set(c, (codeCounts.get(c) || 0) + 1);
+
+      const n = r.name.trim().toLowerCase();
+      if (n) nameCounts.set(n, (nameCounts.get(n) || 0) + 1);
+    });
+
+    return rows.map((r) => {
+      const hasContent =
+        r.name.trim() !== '' ||
+        r.buying_rate_rupees.trim() !== '' ||
+        r.selling_rate_rupees.trim() !== '';
+
+      if (!hasContent) {
+        return {
+          isEmpty: true,
+          duplicateCode: false,
+          duplicateName: false,
+          lowMarginWarning: false,
+          missingRequired: false,
+          errors: [] as string[],
+          warnings: [] as string[],
+        };
+      }
+
+      const errors: string[] = [];
+      const warnings: string[] = [];
+
+      const nameTrimmed = r.name.trim();
+      const codeTrimmed = r.product_code.trim();
+      const buyVal = parseFloat(r.buying_rate_rupees);
+      const sellVal = parseFloat(r.selling_rate_rupees);
+
+      const duplicateNameInSheet =
+        nameTrimmed !== '' && (nameCounts.get(nameTrimmed.toLowerCase()) || 0) > 1;
+      const duplicateNameInCat =
+        nameTrimmed !== '' && existingNameSet.has(nameTrimmed.toLowerCase());
+      const duplicateName = duplicateNameInSheet || duplicateNameInCat;
+
+      if (!nameTrimmed) {
+        errors.push('Missing Name');
+      } else if (duplicateNameInSheet) {
+        errors.push('Duplicate Name in sheet');
+      } else if (duplicateNameInCat) {
+        errors.push('Name already exists in catalogue');
+      }
+
+      const duplicateCodeInSheet =
+        codeTrimmed !== '' && (codeCounts.get(codeTrimmed.toLowerCase()) || 0) > 1;
+      const duplicateCodeInCat =
+        codeTrimmed !== '' && existingCodeSet.has(codeTrimmed.toLowerCase());
+      const duplicateCode = duplicateCodeInSheet || duplicateCodeInCat;
+
+      if (!codeTrimmed) {
+        errors.push('Missing Code');
+      } else if (duplicateCodeInSheet) {
+        errors.push('Duplicate Code in sheet');
+      } else if (duplicateCodeInCat) {
+        errors.push('Code already exists in catalogue');
+      }
+
+      if (isNaN(sellVal) || sellVal <= 0) {
+        errors.push('Selling Rate must be > ₹0');
+      }
+
+      if (r.buying_rate_rupees.trim() !== '' && (isNaN(buyVal) || buyVal < 0)) {
+        errors.push('Invalid Buying Rate');
+      }
+
+      const lowMarginWarning =
+        !isNaN(sellVal) &&
+        sellVal > 0 &&
+        !isNaN(buyVal) &&
+        buyVal > 0 &&
+        sellVal <= buyVal;
+
+      if (lowMarginWarning) {
+        warnings.push(`Sell (₹${sellVal}) ≤ Buy (₹${buyVal})`);
+      }
+
+      return {
+        isEmpty: false,
+        duplicateCode,
+        duplicateName,
+        lowMarginWarning,
+        missingRequired: !nameTrimmed || isNaN(sellVal) || sellVal <= 0,
+        errors,
+        warnings,
+      };
+    });
+  }, [rows, existingCodeSet, existingNameSet]);
 
   if (!isOpen) return null;
 
-  const updateCell = (rowIndex: number, key: keyof PosProductRow, value: any) => {
-    setRows(prev => {
-      const copy = [...prev];
-      copy[rowIndex] = { ...copy[rowIndex], [key]: value };
-      return copy;
+  const updateCell = <K extends keyof BulkSheetRow>(
+    rowIndex: number,
+    key: K,
+    value: BulkSheetRow[K]
+  ) => {
+    setRows((prev) => {
+      const next = [...prev];
+      next[rowIndex] = { ...next[rowIndex], [key]: value };
+      return next;
     });
   };
 
-  const addRow = (count: number = 1) => {
-    setRows(prev => {
-      let highestCode = 0;
-      prev.forEach(r => {
-        const num = parseInt(r.product_code, 10);
-        if (!isNaN(num) && num > highestCode) highestCode = num;
-      });
-      if (highestCode === 0) highestCode = prev.length;
+  const getNextFreeCodeFromRows = (currentRows: BulkSheetRow[]): number => {
+    let maxCode = highestExistingCode;
+    for (const r of currentRows) {
+      const n = parseInt(r.product_code, 10);
+      if (!isNaN(n) && n > maxCode) maxCode = n;
+    }
+    return maxCode + 1;
+  };
 
-      const newRows: PosProductRow[] = [];
-      for (let i = 1; i <= count; i++) {
-        newRows.push({
-          product_code: String(highestCode + i),
+  const addRow = (count = 1) => {
+    setRows((prev) => {
+      let nextCode = getNextFreeCodeFromRows(prev);
+      const added: BulkSheetRow[] = [];
+      for (let i = 0; i < count; i++) {
+        added.push({
           name: '',
-          category: prev[prev.length - 1]?.category || 'Chicken',
-          type: 'Unprocessed (Raw)',
-          unit_type: 'weight',
-          cost_rupees: '',
-          price_rupees: '',
-          track_inventory: false,
+          category: prev[prev.length - 1]?.category || CATEGORIES[0] || 'Chicken',
+          unit: prev[prev.length - 1]?.unit || 'kg',
+          buying_rate_rupees: '',
+          selling_rate_rupees: '',
+          product_code: String(nextCode++),
+          track_in_inventory: true,
         });
       }
-      return [...prev, ...newRows];
+      return [...prev, ...added];
     });
   };
 
   const removeRow = (index: number) => {
-    setRows(prev => {
+    setRows((prev) => {
       if (prev.length <= 1) {
-        return [{
-          product_code: '1',
-          name: '',
-          category: 'Chicken',
-          type: 'Unprocessed (Raw)',
-          unit_type: 'weight',
-          cost_rupees: '',
-          price_rupees: '',
-          track_inventory: false,
-        }];
+        return [
+          {
+            name: '',
+            category: CATEGORIES[0] || 'Chicken',
+            unit: 'kg',
+            buying_rate_rupees: '',
+            selling_rate_rupees: '',
+            product_code: String(highestExistingCode + 1),
+            track_in_inventory: true,
+          },
+        ];
       }
       return prev.filter((_, i) => i !== index);
     });
   };
 
-  const clearEmptyRows = () => {
-    setRows(prev => {
-      const filtered = prev.filter(r => r.name.trim() || r.price_rupees.trim());
-      if (filtered.length === 0) {
-        return [{
-          product_code: '1',
-          name: '',
-          category: 'Chicken',
-          type: 'Unprocessed (Raw)',
-          unit_type: 'weight',
-          cost_rupees: '',
-          price_rupees: '',
-          track_inventory: false,
-        }];
-      }
-      return filtered;
-    });
-  };
-
-  const fillCategoryForAll = (category: string) => {
-    setRows(prev => prev.map(r => ({ ...r, category })));
-  };
-
-  // Keyboard navigation across the grid
-  const handleKeyDown = (e: KeyboardEvent<HTMLElement>, rowIndex: number, colName: string) => {
-    if (e.key === 'Enter' || (e.key === 'Tab' && !e.shiftKey && colName === 'price_rupees')) {
-      if (e.key === 'Enter') e.preventDefault();
+  const handleKeyDown = (e: KeyboardEvent<HTMLElement>, rowIndex: number) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
       if (rowIndex === rows.length - 1) {
         addRow(1);
       }
     }
   };
 
-  // Copy-paste from Excel or Google Sheets
-  const handlePaste = (e: ClipboardEvent<HTMLTableElement>) => {
-    const clipboardData = e.clipboardData.getData('Text');
-    if (!clipboardData) return;
-    e.preventDefault();
+  // Parse multi-line TSV/CSV text into BulkSheetRow[]
+  const parseDelimitedTextToRows = (rawText: string) => {
+    const lines = rawText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
 
-    const pastedLines = clipboardData.split(/\r?\n/).filter(line => line.trim().length > 0);
-    if (pastedLines.length === 0) return;
+    const delimiter = lines[0].includes('\t') ? '\t' : ',';
+    const parsedLines = lines.map((line) =>
+      line.split(delimiter).map((c) => c.replace(/^"(.*)"$/, '$1').trim())
+    );
 
-    const parsedData = pastedLines.map(line => line.split('\t').map(c => c.trim()));
-
-    // If first row looks like a header, skip it
+    // Skip header row if detected
     let startIdx = 0;
-    const firstRowJoined = parsedData[0].join(' ').toLowerCase();
-    if (firstRowJoined.includes('product') || firstRowJoined.includes('name') || firstRowJoined.includes('item') || firstRowJoined.includes('rate') || firstRowJoined.includes('code')) {
+    const firstJoined = parsedLines[0].join(' ').toLowerCase();
+    if (
+      firstJoined.includes('name') ||
+      firstJoined.includes('category') ||
+      firstJoined.includes('selling') ||
+      firstJoined.includes('buying')
+    ) {
       startIdx = 1;
     }
 
-    const dataRows = parsedData.slice(startIdx);
+    const dataRows = parsedLines.slice(startIdx);
     if (dataRows.length === 0) return;
 
-    const newRows: PosProductRow[] = [];
-    let curCodeNum = rows.length > 0 ? parseInt(rows[0].product_code, 10) || 1 : 1;
+    let nextCode = highestExistingCode + 1;
+    const imported: BulkSheetRow[] = dataRows.map((cols) => {
+      // Expected columns: Name | Category | Unit | Buying Rate | Selling Rate | Code | Inventory Tracking
+      const name = cols[0] || '';
+      const category = cols[1] || CATEGORIES[0] || 'Chicken';
+      const unit = normalizeUnit(cols[2] || 'kg');
+      const buyingRate = (cols[3] || '').replace(/[^0-9.]/g, '');
+      const sellingRate = (cols[4] || cols[3] || '').replace(/[^0-9.]/g, '');
+      const explicitCode = (cols[5] || '').replace(/[^0-9A-Za-z-]/g, '');
+      const code = explicitCode || String(nextCode++);
+      const trackStr = (cols[6] || 'true').toLowerCase();
+      const track = !['false', '0', 'no', 'off'].includes(trackStr);
 
-    dataRows.forEach((cols, idx) => {
-      // Possible column mapping:
-      // Pattern 1: [Bill No, Name, Category, Type, Unit Type, Selling Rate]
-      // Pattern 2: [Name, Category, Selling Rate]
-      // Pattern 3: [Name, Selling Rate]
-      let code = '';
-      let name = '';
-      let category = 'Chicken';
-      let type = 'Unprocessed (Raw)';
-      let unit_type: 'weight' | 'piece' | 'live_dual' = 'weight';
-      let price = '';
-
-      if (cols.length === 1) {
-        name = cols[0];
-      } else if (cols.length === 2) {
-        name = cols[0];
-        price = cols[1].replace(/[^0-9.]/g, '');
-      } else if (cols.length === 3) {
-        name = cols[0];
-        category = cols[1] || 'Chicken';
-        price = cols[2].replace(/[^0-9.]/g, '');
-      } else if (cols.length >= 4) {
-        // Check if first col is numeric code
-        if (/^\d+$/.test(cols[0])) {
-          code = cols[0];
-          name = cols[1];
-          category = cols[2] || 'Chicken';
-          price = cols[cols.length - 1].replace(/[^0-9.]/g, '');
-          if (cols.length >= 5) {
-            type = cols[3].toLowerCase().includes('process') ? 'Processed (Cut/Minced)' : 'Unprocessed (Raw)';
-            if (cols.length >= 6) {
-              const u = cols[4].toLowerCase();
-              unit_type = u.includes('pc') || u.includes('piece') ? 'piece' : u.includes('dual') ? 'live_dual' : 'weight';
-            }
-          }
-        } else {
-          name = cols[0];
-          category = cols[1] || 'Chicken';
-          type = cols[2].toLowerCase().includes('process') ? 'Processed (Cut/Minced)' : 'Unprocessed (Raw)';
-          price = cols[cols.length - 1].replace(/[^0-9.]/g, '');
-        }
-      }
-
-      if (!code) {
-        code = String(curCodeNum + idx);
-      }
-
-      newRows.push({
-        product_code: code,
+      return {
         name,
         category,
-        type,
-        unit_type,
-        cost_rupees: '',
-        price_rupees: price,
-        track_inventory: false,
-      });
+        unit,
+        buying_rate_rupees: cols.length >= 5 ? buyingRate : '',
+        selling_rate_rupees: sellingRate,
+        product_code: code,
+        track_in_inventory: track,
+      };
     });
 
-    if (newRows.length > 0) {
-      setRows(newRows);
+    if (imported.length > 0) {
+      setRows(imported);
       setError(null);
+      setSaveSummary(null);
+      setIsPasteBoxOpen(false);
+      setPasteText('');
     }
   };
 
-  // Download Sample Excel/CSV Template
+  const handleGridPaste = (e: ClipboardEvent<HTMLTableElement>) => {
+    const text = e.clipboardData.getData('Text');
+    if (!text || (!text.includes('\n') && !text.includes('\t'))) return;
+    e.preventDefault();
+    parseDelimitedTextToRows(text);
+  };
+
+  const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = String(ev.target?.result || '');
+      parseDelimitedTextToRows(content);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
   const handleDownloadTemplate = () => {
     const csvContent = [
-      'Bill No,Product Name,Category,Type,Unit Type,Selling Rate (₹)',
-      '101,Chicken Curry Cut,Chicken,Unprocessed (Raw),weight,280.00',
-      '102,Chicken Boneless Breast,Chicken,Processed (Cut/Minced),weight,360.00',
-      '103,Mutton Curry Cut,Mutton,Unprocessed (Raw),weight,740.00',
-      '104,Fresh Tiger Prawns,Seafood,Unprocessed (Raw),weight,550.00',
-      '105,Eggs Tray of 30,Eggs,Unprocessed (Raw),piece,180.00',
+      'Name,Category,Unit,Buying Rate (INR),Selling Rate (INR),Code,Inventory Tracking',
+      'Chicken Curry Cut,Chicken,kg,180,240,,true',
+      'Chicken Breast Boneless,Chicken,kg,240,320,,true',
+      'Farm Fresh Eggs (30 Tray),Eggs,tray,150,190,,true',
     ].join('\n');
 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', 'POS_Bulk_Products_Template.csv');
+    link.href = url;
+    link.download = 'bulk_products_template.csv';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
-  // Upload and Parse CSV File
-  const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      if (!text) return;
-
-      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-      if (lines.length === 0) return;
-
-      // Detect separator (, or \t)
-      const separator = lines[0].includes('\t') ? '\t' : ',';
-      let startLine = 0;
-
-      // Check header
-      const header = lines[0].toLowerCase();
-      if (header.includes('name') || header.includes('product') || header.includes('rate') || header.includes('code')) {
-        startLine = 1;
-      }
-
-      const parsedRows: PosProductRow[] = [];
-      for (let i = startLine; i < lines.length; i++) {
-        const parts = lines[i].split(separator).map(p => p.trim().replace(/^"|"$/g, ''));
-        if (parts.length < 2) continue;
-
-        let code = '';
-        let name = '';
-        let category = 'Chicken';
-        let type = 'Unprocessed (Raw)';
-        let unit_type: 'weight' | 'piece' | 'live_dual' = 'weight';
-        let price = '';
-
-        if (/^\d+$/.test(parts[0])) {
-          code = parts[0];
-          name = parts[1] || '';
-          category = parts[2] || 'Chicken';
-          if (parts.length >= 4) type = parts[3].toLowerCase().includes('process') ? 'Processed (Cut/Minced)' : 'Unprocessed (Raw)';
-          if (parts.length >= 5) {
-            const u = parts[4].toLowerCase();
-            unit_type = u.includes('pc') || u.includes('piece') ? 'piece' : u.includes('dual') ? 'live_dual' : 'weight';
-          }
-          price = (parts[5] || parts[parts.length - 1] || '').replace(/[^0-9.]/g, '');
-        } else {
-          code = String(i + 1);
-          name = parts[0];
-          category = parts[1] || 'Chicken';
-          price = (parts[parts.length - 1] || '').replace(/[^0-9.]/g, '');
-        }
-
-        if (name) {
-          parsedRows.push({
-            product_code: code,
-            name,
-            category,
-            type,
-            unit_type,
-            cost_rupees: '',
-            price_rupees: price,
-            track_inventory: false,
-          });
-        }
-      }
-
-      if (parsedRows.length > 0) {
-        setRows(parsedRows);
-        setError(null);
-      }
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    };
-
-    reader.readAsText(file);
-  };
-
-  // Submit to POS
-  const handleSave = async () => {
+  const handleSaveAll = async () => {
     setError(null);
-    const validRows = rows.filter(r => r.name.trim() && r.price_rupees.trim());
-    if (validRows.length === 0) {
-      setError('Please fill in at least one product with a Name and Selling Rate.');
+    setSaveSummary(null);
+
+    const nonEmptyEntries = rows
+      .map((row, idx) => ({ row, idx, validation: rowValidations[idx] }))
+      .filter((item) => !item.validation.isEmpty);
+
+    if (nonEmptyEntries.length === 0) {
+      setError('Please enter at least one product row before saving.');
       return;
     }
 
-    // Check rate valid numbers
-    for (let i = 0; i < validRows.length; i++) {
-      const price = parseFloat(validRows[i].price_rupees);
-      if (isNaN(price) || price <= 0) {
-        setError(`Row #${i + 1} (${validRows[i].name}) has an invalid Selling Rate: "${validRows[i].price_rupees}".`);
-        return;
+    const clientFailedRows: Array<{ rowIndex: number; rowName?: string; messages: string[] }> = [];
+    const validPayloadRows: Array<any> = [];
+    const validOriginalIndices: number[] = [];
+
+    nonEmptyEntries.forEach(({ row, idx, validation }) => {
+      if (validation.errors.length > 0) {
+        clientFailedRows.push({
+          rowIndex: idx + 1,
+          rowName: row.name || `Row #${idx + 1}`,
+          messages: validation.errors,
+        });
+      } else {
+        const unitType: 'weight' | 'piece' = ['pcs', 'tray', 'pack'].includes(row.unit)
+          ? 'piece'
+          : 'weight';
+        validPayloadRows.push({
+          name: row.name.trim(),
+          category: row.category.trim() || 'Chicken',
+          unit: row.unit,
+          unit_type: unitType,
+          buying_rate_rupees: parseFloat(row.buying_rate_rupees || '0') || 0,
+          cost_price_rupees: parseFloat(row.buying_rate_rupees || '0') || 0,
+          selling_rate_rupees: parseFloat(row.selling_rate_rupees || '0') || 0,
+          price_rupees: parseFloat(row.selling_rate_rupees || '0') || 0,
+          product_code: row.product_code.trim(),
+          track_in_inventory: row.track_in_inventory,
+        });
+        validOriginalIndices.push(idx + 1);
       }
+    });
+
+    if (validPayloadRows.length === 0) {
+      setSaveSummary({
+        createdCount: 0,
+        updatedCount: 0,
+        errorRows: clientFailedRows,
+      });
+      return;
     }
 
+    setIsSaving(true);
     try {
-      const payloadRows = validRows.map(r => ({
-        name: r.name.trim(),
-        category: r.category.trim() || 'Chicken',
-        type: r.type.trim() || 'Unprocessed (Raw)',
-        unit_type: r.unit_type,
-        product_code: r.product_code.trim() || undefined,
-        cost_rupees: parseFloat(r.cost_rupees) || 0,
-        price_rupees: parseFloat(r.price_rupees) || 0,
-        track_in_inventory: r.track_inventory ? 1 : 0,
+      const res = await window.api.invoke(IPC_CHANNELS.INVENTORY.BULK_IMPORT_PRODUCTS, {
+        rows: validPayloadRows,
+      });
+      if (!res?.success) {
+        throw new Error(res?.error?.message || 'Failed to save bulk products');
+      }
+
+      const backendResult = res.data || { createdCount: 0, updatedCount: 0, errorRows: [] };
+      const mappedBackendErrors = (backendResult.errorRows || []).map((er: any) => ({
+        rowIndex: validOriginalIndices[er.rowIndex] || er.rowIndex + 1,
+        rowName: validPayloadRows[er.rowIndex]?.name || `Row #${er.rowIndex + 1}`,
+        messages: er.messages || ['Failed validation'],
       }));
 
-      const result = await bulkAddMutation.mutateAsync(payloadRows as any);
-      setImportResult(result);
-    } catch (e: any) {
-      setError(e.message || 'Failed to save products to catalogue');
+      const combinedErrors = [...clientFailedRows, ...mappedBackendErrors];
+      setSaveSummary({
+        createdCount: Number(backendResult.createdCount || 0),
+        updatedCount: Number(backendResult.updatedCount || 0),
+        errorRows: combinedErrors,
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ['adminProducts'] });
+      await queryClient.invalidateQueries({ queryKey: ['products'] });
+      if (onSuccess) onSuccess();
+    } catch (err: any) {
+      setError(err?.message || 'An unexpected error occurred while saving products');
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const validCount = rows.filter(r => r.name.trim() && parseFloat(r.price_rupees) > 0).length;
-  const isSaving = bulkAddMutation.isPending;
+  const filledCount = rowValidations.filter((v) => !v.isEmpty).length;
+  const errorCount = rowValidations.filter((v) => !v.isEmpty && v.errors.length > 0).length;
+  const lowMarginCount = rowValidations.filter((v) => !v.isEmpty && v.lowMarginWarning).length;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-      <div className="bg-surface-app rounded-2xl shadow-2xl w-full max-w-6xl max-h-[92vh] flex flex-col border border-border-subtle overflow-hidden">
-        
-        {/* Modal Top Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border-subtle bg-surface-card shrink-0">
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6">
+      <div className="bg-surface-card border border-border-subtle rounded-2xl shadow-2xl w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden">
+        {/* Modal Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-4 border-b border-border-subtle bg-surface-app shrink-0">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-brand-500/15 text-brand-500 border border-brand-500/20">
-              <FileSpreadsheet className="w-5 h-5" />
+            <div className="w-10 h-10 rounded-xl bg-brand-500/15 border border-brand-500/30 flex items-center justify-center text-brand-400">
+              <FileSpreadsheet size={20} />
             </div>
             <div>
-              <h2 className="text-base font-extrabold text-text-primary flex items-center gap-2">
-                Bulk Add Products
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-brand-500/10 text-brand-500 border border-brand-500/20">
-                  POS Quick Entry Grid
-                </span>
+              <h2 className="text-base font-black text-text-primary">
+                Bulk Add Products (Spreadsheet Entry)
               </h2>
-              <p className="text-xs text-text-muted mt-0.5">
-                Fast multi-item entry with auto bill numbers, or copy-paste directly from Excel / CSV spreadsheet
+              <p className="text-xs text-text-muted">
+                Starts empty • Auto-suggests next free numeric code • Checks duplicates & low/zero margins
               </p>
             </div>
           </div>
+
           <button
+            type="button"
             onClick={onClose}
-            className="p-2 rounded-xl hover:bg-surface-hover text-text-muted hover:text-text-primary transition-colors"
+            className="p-2 rounded-xl text-text-muted hover:text-text-primary hover:bg-surface-hover cursor-pointer self-end sm:self-auto"
           >
-            <X className="w-5 h-5" />
+            <X size={18} />
           </button>
         </div>
 
-        {/* Toolbar & Fast Action Controls */}
-        <div className="px-6 py-3 bg-surface-panel border-b border-border-subtle flex flex-wrap items-center justify-between gap-3 shrink-0">
-          {/* Left Tools: Add rows, Clear, Fill Category */}
-          <div className="flex items-center gap-2 flex-wrap">
+        {/* Toolbar Actions: + Add Row, Paste from Excel, Import CSV, Download CSV Template */}
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 border-b border-border-subtle bg-surface-card shrink-0">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => addRow(1)}
-              className="px-3 py-1.5 rounded-xl bg-surface-card border border-border-subtle text-xs font-bold text-text-primary hover:bg-surface-hover hover:border-border-focus transition-all flex items-center gap-1.5 shadow-2xs"
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-extrabold cursor-pointer shadow-xs transition-colors"
             >
-              <Plus size={14} className="text-brand-500" />
-              <span>+ 1 Row</span>
+              <Plus size={14} />
+              <span>+ Add Row</span>
             </button>
+
             <button
               type="button"
-              onClick={() => addRow(5)}
-              className="px-3 py-1.5 rounded-xl bg-surface-card border border-border-subtle text-xs font-bold text-text-primary hover:bg-surface-hover hover:border-border-focus transition-all flex items-center gap-1.5 shadow-2xs"
+              onClick={() => setIsPasteBoxOpen((prev) => !prev)}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-surface-app hover:bg-surface-hover border border-border-subtle text-xs font-extrabold text-text-primary cursor-pointer transition-colors"
             >
-              <Plus size={14} className="text-brand-500" />
-              <span>+ 5 Rows</span>
-            </button>
-            <button
-              type="button"
-              onClick={clearEmptyRows}
-              className="px-3 py-1.5 rounded-xl bg-surface-card border border-border-subtle text-xs font-semibold text-text-muted hover:text-text-primary hover:bg-surface-hover transition-all"
-            >
-              Clear Empty Rows
+              <ClipboardPaste size={14} className="text-purple-400" />
+              <span>Paste from Excel</span>
             </button>
 
-            <div className="h-4 w-px bg-border-subtle mx-1 hidden sm:block" />
-
-            {/* Quick Category Setter */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-[11px] font-semibold text-text-muted hidden md:inline">Quick Category:</span>
-              <select
-                onChange={(e) => {
-                  if (e.target.value) fillCategoryForAll(e.target.value);
-                }}
-                defaultValue=""
-                className="bg-surface-card border border-border-subtle rounded-xl px-2.5 py-1.5 text-xs font-bold text-text-secondary outline-none focus:border-brand-500"
-              >
-                <option value="" disabled>Set All Category...</option>
-                {DEFAULT_CATEGORIES.map(cat => (
-                  <option key={cat} value={cat}>{cat}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          {/* Right Tools: Template download & CSV upload */}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleDownloadTemplate}
-              className="px-3 py-1.5 rounded-xl bg-surface-card border border-border-subtle text-xs font-semibold text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-all flex items-center gap-1.5"
-              title="Download CSV template to fill in Excel"
-            >
-              <Download size={13} className="text-brand-500" />
-              <span>Download Template</span>
-            </button>
-
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleFileUpload}
-              accept=".csv,.txt"
-              className="hidden"
-            />
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="px-3 py-1.5 rounded-xl bg-brand-500/10 border border-brand-500/30 text-xs font-bold text-brand-500 hover:bg-brand-500/20 transition-all flex items-center gap-1.5"
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-surface-app hover:bg-surface-hover border border-border-subtle text-xs font-extrabold text-text-primary cursor-pointer transition-colors"
             >
-              <Upload size={13} />
-              <span>Upload CSV / Excel</span>
+              <Upload size={14} className="text-blue-400" />
+              <span>Import CSV</span>
             </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.tsv,.txt"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+
+            <button
+              type="button"
+              onClick={handleDownloadTemplate}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-surface-app hover:bg-surface-hover border border-border-subtle text-xs font-extrabold text-text-primary cursor-pointer transition-colors"
+            >
+              <Download size={14} className="text-emerald-400" />
+              <span>Download CSV Template</span>
+            </button>
+          </div>
+
+          {/* Live Validation Counters */}
+          <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+            <span className="px-2.5 py-1 rounded-lg bg-surface-app border border-border-subtle text-text-secondary">
+              Filled Rows: <strong className="text-text-primary">{filledCount}</strong>
+            </span>
+            {errorCount > 0 && (
+              <span className="px-2.5 py-1 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-400">
+                Duplicate / Errors: <strong>{errorCount}</strong>
+              </span>
+            )}
+            {lowMarginCount > 0 && (
+              <span className="px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                ⚠️ Sell ≤ Buy: <strong>{lowMarginCount}</strong>
+              </span>
+            )}
           </div>
         </div>
 
-        {/* Modal Main Grid View */}
-        <div className="flex-1 overflow-auto p-6 relative">
-          {importResult && (!importResult.errorRows || importResult.errorRows.length === 0) ? (
-            <div className="absolute inset-0 bg-surface-app flex flex-col items-center justify-center p-6 text-center animate-in zoom-in-95 duration-200">
-              <div className="w-16 h-16 rounded-full bg-emerald-500/20 text-emerald-500 flex items-center justify-center mb-4 shadow-subtle border border-emerald-500/30">
-                <CheckCircle2 className="w-8 h-8" />
-              </div>
-              <h3 className="text-xl font-extrabold text-text-primary mb-2">Products Successfully Added</h3>
-              <p className="text-text-secondary text-sm mb-6 max-w-md">
-                Successfully added <span className="font-bold text-emerald-400">{importResult.createdCount + (importResult.updatedCount || 0)} items</span> to your catalogue. They are now immediately ready with bill numbers on the POS billing screen!
-              </p>
-              <button
-                onClick={onClose}
-                className="px-6 py-2.5 rounded-xl bg-brand-500 text-white font-bold hover:bg-brand-600 shadow-lg shadow-brand-500/20 transition-all"
-              >
-                Done & Return to Catalogue
-              </button>
-            </div>
-          ) : (
-            <div className="min-w-[900px] space-y-4">
-              {error && (
-                <div className="px-4 py-3 rounded-xl bg-rose-500/10 border border-rose-500/20 flex items-start gap-3 text-rose-400 text-xs font-semibold">
-                  <AlertTriangle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
-                  <div className="flex-1">
-                    <p>{error}</p>
-                    {importResult?.errorRows && importResult.errorRows.length > 0 && (
-                      <ul className="list-disc list-inside mt-2 text-xs opacity-90 space-y-0.5">
-                        {importResult.errorRows.slice(0, 5).map((er, i) => (
-                          <li key={i}>Row {er.rowIndex + 1}: {er.messages?.join(', ') || er.message}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Data Table */}
-              <div className="border border-border-subtle rounded-2xl overflow-hidden bg-surface-card shadow-sm">
-                <table className="w-full text-left border-collapse" onPaste={handlePaste}>
-                  <thead>
-                    <tr className="bg-surface-panel border-b border-border-subtle text-[10px] font-extrabold text-text-muted uppercase tracking-wider">
-                      <th className="w-12 px-3 py-3 text-center">#</th>
-                      <th className="w-28 px-3 py-3 border-l border-border-subtle/50">
-                        Bill No. / Code *
-                      </th>
-                      <th className="px-4 py-3 border-l border-border-subtle/50">
-                        Product Name *
-                      </th>
-                      <th className="w-32 px-3 py-3 border-l border-border-subtle/50">
-                        Category *
-                      </th>
-                      <th className="w-36 px-3 py-3 border-l border-border-subtle/50">
-                        Type
-                      </th>
-                      <th className="w-32 px-3 py-3 border-l border-border-subtle/50">
-                        Unit Type
-                      </th>
-                      <th className="w-32 px-3 py-3 border-l border-border-subtle/50 text-right">
-                        Buying Rate (₹)
-                      </th>
-                      <th className="w-32 px-3 py-3 border-l border-border-subtle/50 text-right">
-                        Selling Rate (₹) *
-                      </th>
-                      <th className="w-20 px-2 py-3 border-l border-border-subtle/50 text-center">
-                        Track Inv
-                      </th>
-                      <th className="w-12 px-3 py-3 border-l border-border-subtle/50 text-center"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-border-subtle/40 text-xs">
-                    {rows.map((row, rIdx) => {
-                      const isValid = row.name.trim() && parseFloat(row.price_rupees) > 0;
-                      const isPartial = row.name.trim() || row.price_rupees.trim();
-
-                      return (
-                        <tr
-                          key={rIdx}
-                          className="hover:bg-surface-panel/40 focus-within:bg-brand-500/5 group transition-colors"
-                        >
-                          {/* Row Status Indicator */}
-                          <td className="px-2 py-2 text-center text-[10px] font-mono font-bold bg-surface-panel/30">
-                            <div className="flex items-center justify-center gap-1">
-                              {isValid ? (
-                                <Check size={13} className="text-emerald-400" />
-                              ) : isPartial ? (
-                                <span className="w-2 h-2 rounded-full bg-amber-400" />
-                              ) : (
-                                <span className="text-text-muted">{rIdx + 1}</span>
-                              )}
-                            </div>
-                          </td>
-
-                          {/* 1. Bill No. / Code */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <div className="relative flex items-center px-2">
-                              <span className="text-[11px] font-extrabold text-brand-500 font-mono select-none">#</span>
-                              <input
-                                type="text"
-                                value={row.product_code}
-                                onChange={(e) => updateCell(rIdx, 'product_code', e.target.value.toUpperCase())}
-                                onKeyDown={(e) => handleKeyDown(e, rIdx, 'product_code')}
-                                placeholder={String(rIdx + 1)}
-                                className="w-full h-10 pl-1 pr-2 bg-transparent text-xs font-mono font-extrabold text-text-primary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors"
-                              />
-                            </div>
-                          </td>
-
-                          {/* 2. Product Name */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <input
-                              type="text"
-                              value={row.name}
-                              onChange={(e) => updateCell(rIdx, 'name', e.target.value)}
-                              onKeyDown={(e) => handleKeyDown(e, rIdx, 'name')}
-                              placeholder={rIdx === 0 ? 'e.g. Chicken Curry Cut' : 'Item name...'}
-                              className="w-full h-10 px-3.5 bg-transparent text-xs font-bold text-text-primary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors"
-                            />
-                          </td>
-
-                          {/* 3. Category */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <select
-                              value={row.category}
-                              onChange={(e) => updateCell(rIdx, 'category', e.target.value)}
-                              className="w-full h-10 px-3 bg-transparent text-xs font-bold text-text-primary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors cursor-pointer"
-                            >
-                              {DEFAULT_CATEGORIES.map(cat => (
-                                <option key={cat} value={cat} className="bg-surface-card text-text-primary font-bold">
-                                  {cat}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-
-                          {/* 4. Type */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <select
-                              value={row.type}
-                              onChange={(e) => updateCell(rIdx, 'type', e.target.value)}
-                              className="w-full h-10 px-3 bg-transparent text-[11px] font-semibold text-text-secondary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors cursor-pointer"
-                            >
-                              {DEFAULT_TYPES.map(t => (
-                                <option key={t} value={t} className="bg-surface-card text-text-primary">
-                                  {t}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-
-                          {/* 5. Unit Type */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <select
-                              value={row.unit_type}
-                              onChange={(e) => updateCell(rIdx, 'unit_type', e.target.value as any)}
-                              className="w-full h-10 px-3 bg-transparent text-xs font-medium text-text-secondary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors cursor-pointer"
-                            >
-                              {DEFAULT_UNIT_TYPES.map(ut => (
-                                <option key={ut.value} value={ut.value} className="bg-surface-card text-text-primary">
-                                  {ut.label}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-
-                          {/* 6. Buying Rate (₹) */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <div className="relative flex items-center px-2">
-                              <span className="text-xs font-bold text-text-muted select-none">₹</span>
-                              <input
-                                type="text"
-                                inputMode="decimal"
-                                value={row.cost_rupees}
-                                onChange={(e) => updateCell(rIdx, 'cost_rupees', e.target.value)}
-                                placeholder="0.00"
-                                className="w-full h-10 pl-1 pr-2 bg-transparent text-xs font-mono font-bold text-right text-text-secondary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors"
-                              />
-                            </div>
-                          </td>
-
-                          {/* 7. Selling Rate (₹) */}
-                          <td className="p-0 border-l border-border-subtle/50">
-                            <div className="relative flex items-center px-2">
-                              <span className="text-xs font-bold text-text-muted select-none">₹</span>
-                              <input
-                                type="text"
-                                inputMode="decimal"
-                                value={row.price_rupees}
-                                onChange={(e) => updateCell(rIdx, 'price_rupees', e.target.value)}
-                                onKeyDown={(e) => handleKeyDown(e, rIdx, 'price_rupees')}
-                                placeholder={rIdx === 0 ? '280.00' : '0.00'}
-                                className="w-full h-10 pl-1 pr-2 bg-transparent text-xs font-mono font-extrabold text-right text-text-primary focus:outline-none focus:bg-surface-card focus:ring-1 focus:ring-inset focus:ring-brand-500 transition-colors"
-                              />
-                            </div>
-                          </td>
-
-                          {/* 8. Track Inv */}
-                          <td className="p-0 border-l border-border-subtle/50 text-center">
-                            <input
-                              type="checkbox"
-                              checked={row.track_inventory}
-                              onChange={(e) => updateCell(rIdx, 'track_inventory', e.target.checked)}
-                              className="rounded border-border-subtle text-brand-500 focus:ring-brand-500 cursor-pointer h-4 w-4"
-                            />
-                          </td>
-
-                          {/* Delete Row Button */}
-                          <td className="p-0 border-l border-border-subtle/50 text-center">
-                            <button
-                              type="button"
-                              onClick={() => removeRow(rIdx)}
-                              className="w-full h-10 flex items-center justify-center text-text-muted hover:text-rose-400 hover:bg-rose-500/10 transition-colors opacity-40 group-hover:opacity-100"
-                              title="Delete Row"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Bottom Quick Row Adding Pill */}
-              <div className="flex items-center justify-between text-xs text-text-muted pt-1">
-                <button
-                  type="button"
-                  onClick={() => addRow(1)}
-                  className="px-4 py-2 text-xs font-bold text-brand-500 hover:bg-brand-500/10 rounded-xl transition-colors inline-flex items-center gap-1.5"
-                >
-                  <Plus className="w-4 h-4" /> Add Row (or press Enter in last cell)
-                </button>
-                <div className="flex items-center gap-2 text-[11px]">
-                  <span className="font-semibold text-text-primary">{validCount}</span> items ready to add
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Modal Bottom Footer */}
-        {(!importResult || (importResult.errorRows && importResult.errorRows.length > 0)) && (
-          <div className="px-6 py-4 border-t border-border-subtle bg-surface-card flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
-            {/* Keyboard shortcut tips */}
-            <div className="flex items-center gap-2 text-xs text-text-muted">
-              <kbd className="px-1.5 py-0.5 rounded bg-surface-panel border border-border-subtle font-mono text-[10px] font-bold">Tab</kbd>
-              <span>or</span>
-              <kbd className="px-1.5 py-0.5 rounded bg-surface-panel border border-border-subtle font-mono text-[10px] font-bold">Enter</kbd>
-              <span>moves between cells</span>
-              <span className="mx-1.5 opacity-30">|</span>
-              <kbd className="px-1.5 py-0.5 rounded bg-surface-panel border border-border-subtle font-mono text-[10px] font-bold">Ctrl+V</kbd>
-              <span>pastes Excel data</span>
-            </div>
-
-            {/* Actions */}
-            <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
+        {/* Optional Paste from Excel Drawer */}
+        {isPasteBoxOpen && (
+          <div className="px-5 py-3 bg-surface-app border-b border-border-subtle space-y-2 shrink-0">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-extrabold text-text-primary">
+                Paste multi-line rows from Excel / Google Sheets (Columns: Name, Category, Unit, Buying Rate, Selling Rate, Code)
+              </span>
               <button
                 type="button"
-                onClick={onClose}
-                className="px-5 py-2.5 rounded-xl border border-border-subtle text-xs font-bold text-text-secondary hover:bg-surface-hover transition-colors"
+                onClick={() => setIsPasteBoxOpen(false)}
+                className="text-xs text-text-muted hover:text-text-primary cursor-pointer"
               >
-                Cancel
+                Close
               </button>
+            </div>
+            <textarea
+              value={pasteText}
+              onChange={(e) => setPasteText(e.target.value)}
+              rows={4}
+              placeholder="Paste tab-separated (Excel) or comma-separated lines here..."
+              className="w-full p-2.5 rounded-xl bg-surface-card border border-border-subtle text-xs font-mono text-text-primary outline-none focus:border-brand-500"
+            />
+            <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={handleSave}
-                disabled={isSaving || validCount === 0}
-                className="px-6 py-2.5 rounded-xl bg-brand-500 text-white text-xs font-bold hover:bg-brand-600 transition-all shadow-lg shadow-brand-500/20 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                onClick={() => parseDelimitedTextToRows(pasteText)}
+                className="px-3.5 py-1.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-extrabold cursor-pointer"
               >
-                {isSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                {isSaving ? 'Saving Products...' : `Save & Add ${validCount} Products to POS`}
+                Apply Pasted Rows to Grid
               </button>
             </div>
           </div>
         )}
+
+        {/* Save Result Summary Banner */}
+        {saveSummary && (
+          <div className="px-5 py-3 bg-surface-app border-b border-border-subtle space-y-2 shrink-0">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-extrabold">
+                <CheckCircle2 size={16} className="text-emerald-400" />
+                <span className="text-emerald-400">
+                  Created {saveSummary.createdCount} product{saveSummary.createdCount === 1 ? '' : 's'}
+                </span>
+                <span className="text-text-muted">•</span>
+                <span
+                  className={
+                    saveSummary.errorRows.length > 0 ? 'text-rose-400' : 'text-text-secondary'
+                  }
+                >
+                  Failed {saveSummary.errorRows.length} row{saveSummary.errorRows.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              {saveSummary.errorRows.length === 0 && saveSummary.createdCount > 0 && (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-xs font-bold cursor-pointer"
+                >
+                  Done & Close
+                </button>
+              )}
+            </div>
+
+            {saveSummary.errorRows.length > 0 && (
+              <div className="max-h-28 overflow-y-auto space-y-1 bg-rose-500/10 border border-rose-500/30 rounded-xl p-2.5 text-xs text-rose-300">
+                {saveSummary.errorRows.map((er, i) => (
+                  <div key={i} className="font-semibold">
+                    • Row #{er.rowIndex} ({er.rowName || 'Unnamed'}): {er.messages.join(', ')}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {error && (
+          <div className="mx-5 mt-3 p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-xs font-bold text-rose-400 flex items-center gap-2 shrink-0">
+            <AlertTriangle size={15} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {/* Spreadsheet Grid */}
+        <div className="flex-1 min-h-0 overflow-auto p-4 sm:p-5">
+          <div className="border border-border-subtle rounded-2xl overflow-hidden">
+            <table className="w-full border-collapse text-left text-xs" onPaste={handleGridPaste}>
+              <thead className="bg-surface-app border-b border-border-subtle text-[11px] font-black uppercase tracking-wider text-text-secondary sticky top-0 z-10">
+                <tr>
+                  <th className="p-2.5 w-10 text-center">#</th>
+                  <th className="p-2.5 min-w-[200px]">Name *</th>
+                  <th className="p-2.5 w-40">Category</th>
+                  <th className="p-2.5 w-28">Unit</th>
+                  <th className="p-2.5 w-36 text-right">Buying Rate (₹)</th>
+                  <th className="p-2.5 w-36 text-right">Selling Rate (₹) *</th>
+                  <th className="p-2.5 w-28">Code</th>
+                  <th className="p-2.5 w-36 text-center">Inventory Tracking</th>
+                  <th className="p-2.5 min-w-[160px]">Validation</th>
+                  <th className="p-2.5 w-10"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border-subtle/60">
+                {rows.map((row, idx) => {
+                  const v = rowValidations[idx];
+                  const hasDupError = !v.isEmpty && (v.duplicateCode || v.duplicateName);
+                  const hasLowMargin = !v.isEmpty && v.lowMarginWarning;
+
+                  return (
+                    <tr
+                      key={idx}
+                      className={`transition-colors ${
+                        hasDupError || (!v.isEmpty && v.errors.length > 0)
+                          ? 'bg-rose-500/10'
+                          : hasLowMargin
+                          ? 'bg-amber-500/10'
+                          : 'hover:bg-surface-hover/40'
+                      }`}
+                    >
+                      <td className="p-2 text-center font-mono font-bold text-text-muted">
+                        {idx + 1}
+                      </td>
+
+                      {/* Name */}
+                      <td className="p-2">
+                        <input
+                          type="text"
+                          value={row.name}
+                          onChange={(e) => updateCell(idx, 'name', e.target.value)}
+                          onKeyDown={(e) => handleKeyDown(e, idx)}
+                          placeholder="e.g. Chicken Curry Cut"
+                          className={`w-full px-2.5 py-1.5 rounded-lg bg-surface-app border text-xs font-bold text-text-primary outline-none ${
+                            v.duplicateName
+                              ? 'border-rose-500 text-rose-300'
+                              : 'border-border-subtle focus:border-brand-500'
+                          }`}
+                        />
+                      </td>
+
+                      {/* Category */}
+                      <td className="p-2">
+                        <select
+                          value={row.category}
+                          onChange={(e) => updateCell(idx, 'category', e.target.value)}
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-surface-app border border-border-subtle text-xs font-bold text-text-primary outline-none focus:border-brand-500"
+                        >
+                          {CATEGORIES.map((cat) => (
+                            <option key={cat} value={cat}>
+                              {cat}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+
+                      {/* Unit (kg, g, pcs, tray, pack) */}
+                      <td className="p-2">
+                        <select
+                          value={row.unit}
+                          onChange={(e) =>
+                            updateCell(idx, 'unit', e.target.value as StandardUnitOption)
+                          }
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-surface-app border border-border-subtle text-xs font-mono font-bold text-text-primary outline-none focus:border-brand-500"
+                        >
+                          {STANDARD_UNITS.map((u) => (
+                            <option key={u.value} value={u.value}>
+                              {u.label}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+
+                      {/* Buying Rate (₹) */}
+                      <td className="p-2">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={row.buying_rate_rupees}
+                          onChange={(e) => updateCell(idx, 'buying_rate_rupees', e.target.value)}
+                          onKeyDown={(e) => handleKeyDown(e, idx)}
+                          placeholder="0.00"
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-surface-app border border-border-subtle text-xs font-mono font-bold text-right text-text-primary outline-none focus:border-brand-500"
+                        />
+                      </td>
+
+                      {/* Selling Rate (₹) */}
+                      <td className="p-2">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={row.selling_rate_rupees}
+                          onChange={(e) => updateCell(idx, 'selling_rate_rupees', e.target.value)}
+                          onKeyDown={(e) => handleKeyDown(e, idx)}
+                          placeholder="0.00"
+                          className={`w-full px-2.5 py-1.5 rounded-lg bg-surface-app border text-xs font-mono font-black text-right outline-none ${
+                            hasLowMargin
+                              ? 'border-amber-500 text-amber-300'
+                              : 'border-border-subtle text-emerald-400 focus:border-brand-500'
+                          }`}
+                        />
+                      </td>
+
+                      {/* Code (Auto-suggested numeric code) */}
+                      <td className="p-2">
+                        <input
+                          type="text"
+                          value={row.product_code}
+                          onChange={(e) => updateCell(idx, 'product_code', e.target.value)}
+                          onKeyDown={(e) => handleKeyDown(e, idx)}
+                          className={`w-full px-2.5 py-1.5 rounded-lg bg-surface-app border text-xs font-mono font-bold text-center outline-none ${
+                            v.duplicateCode
+                              ? 'border-rose-500 text-rose-300'
+                              : 'border-border-subtle text-brand-400 focus:border-brand-500'
+                          }`}
+                        />
+                      </td>
+
+                      {/* Inventory Tracking Toggle */}
+                      <td className="p-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateCell(idx, 'track_in_inventory', !row.track_in_inventory)
+                          }
+                          className={`px-3 py-1 rounded-full text-[11px] font-extrabold border transition-colors cursor-pointer ${
+                            row.track_in_inventory
+                              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                              : 'bg-surface-app text-text-muted border-border-subtle'
+                          }`}
+                        >
+                          {row.track_in_inventory ? 'ON' : 'OFF'}
+                        </button>
+                      </td>
+
+                      {/* Row Validation Status */}
+                      <td className="p-2">
+                        {v.isEmpty ? (
+                          <span className="text-[11px] text-text-muted italic">Empty row</span>
+                        ) : v.errors.length > 0 ? (
+                          <div className="flex flex-col gap-0.5">
+                            {v.errors.map((errStr, i) => (
+                              <span
+                                key={i}
+                                className="inline-flex items-center gap-1 text-[11px] font-extrabold text-rose-400"
+                              >
+                                <AlertTriangle size={11} /> {errStr}
+                              </span>
+                            ))}
+                          </div>
+                        ) : v.lowMarginWarning ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-extrabold">
+                            <AlertTriangle size={11} /> Sell ≤ Buy ({v.warnings[0]})
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-emerald-400">
+                            <CheckCircle2 size={12} /> Ready
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Remove Row */}
+                      <td className="p-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() => removeRow(idx)}
+                          className="p-1.5 rounded-lg text-text-muted hover:text-rose-400 hover:bg-rose-500/10 cursor-pointer"
+                          title="Remove row"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Footer with Save All */}
+        <div className="flex items-center justify-between gap-3 px-5 py-4 border-t border-border-subtle bg-surface-app shrink-0">
+          <div className="text-xs text-text-muted">
+            Tip: Press <kbd className="px-1.5 py-0.5 rounded bg-surface-card border border-border-subtle font-mono">Enter</kbd> on the last row to add a new row, or paste directly from Excel.
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 rounded-xl bg-surface-card hover:bg-surface-hover border border-border-subtle text-xs font-bold text-text-secondary cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={isSaving || filledCount === 0}
+              onClick={handleSaveAll}
+              className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-white text-xs font-black cursor-pointer shadow-md transition-all"
+            >
+              {isSaving ? (
+                <>
+                  <RefreshCw size={14} className="animate-spin" />
+                  <span>Saving Products...</span>
+                </>
+              ) : (
+                <>
+                  <Save size={14} />
+                  <span>Save All ({filledCount})</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

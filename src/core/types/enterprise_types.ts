@@ -89,6 +89,9 @@ export interface Expense {
   category_id: number;
   category_name?: string;
   vendor_name: string | null;
+  employee_id?: number | null;
+  employee_name?: string | null;
+  photo_url?: string | null;
   amount_paise: number;
   gst_paise: number;
   payment_method: string;
@@ -204,7 +207,7 @@ export interface EggMarketPrice {
 export interface AccountingLedgerEntry {
   id: number;
   date: string;
-  account_type: 'Cash' | 'Sales' | 'Purchase' | 'Expense' | 'Supplier' | 'Customer' | 'Employee_Advance' | 'Variance';
+  account_type: 'Cash' | 'Bank' | 'Sales' | 'Purchase' | 'Expense' | 'Supplier' | 'Customer' | 'Employee_Advance' | 'Variance';
   reference_id: string | null;
   description: string;
   debit_paise: number;

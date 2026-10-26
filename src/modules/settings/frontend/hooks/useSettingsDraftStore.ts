@@ -197,6 +197,9 @@ export const DEFAULT_APPEARANCE_DRAFT: AppearanceConfig = {
   skipPaymentConfirmation: false,
   showCalculatorWidget: true,
   defaultPaymentMethod: 'cash',
+  billingStyle: 'standard',
+  sidebarCollapsed: false,
+  sidebarHoverExpand: true,
 };
 
 export const DEFAULT_YIELD_RATIOS_DRAFT: YieldRatiosDraft = {

@@ -123,7 +123,7 @@ export default function LastBillStatusPanel({ variant = 'embedded' }: LastBillSt
 
   const handleSendTestHi = async (overridePhone?: string) => {
     if (!lastCompletedInvoice) return;
-    const rawPhone = (overridePhone || lastCompletedInvoice.invoice.customer_phone || (lastCompletedInvoice.customer as any)?.phone || whatsAppPhoneInput).trim();
+    const rawPhone = (overridePhone || (lastCompletedInvoice.invoice as any).customer_phone || (lastCompletedInvoice as any).customer?.phone || whatsAppPhoneInput).trim();
     if (!rawPhone) {
       setShowWhatsAppPhoneModal(true);
       return;
@@ -806,8 +806,8 @@ export default function LastBillStatusPanel({ variant = 'embedded' }: LastBillSt
             invoiceId={lastCompletedInvoice.invoice.id}
             invoiceNumber={lastCompletedInvoice.invoice.invoice_number}
             customerId={lastCompletedInvoice.invoice.customer_id}
-            customerName={lastCompletedInvoice.customer?.name}
-            initialPhone={lastCompletedInvoice.customer?.whatsapp || lastCompletedInvoice.customer?.phone || ''}
+            customerName={(lastCompletedInvoice as any).customer?.name}
+            initialPhone={(lastCompletedInvoice as any).customer?.whatsapp || (lastCompletedInvoice as any).customer?.phone || ''}
             onClose={() => setShowWhatsAppPhoneModal(false)}
             onSuccess={() => {
               setWhatsAppFeedback({ type: 'success', text: '✓ Bill queued for WhatsApp delivery!' });

@@ -3,6 +3,7 @@ import { logger, auditLogger } from '../../../../core/backend/logger';
 import { authService } from '../../../auth/backend/service/auth_service';
 import { cashBoxService } from '../../../cashbox/backend/service/cashbox_service';
 import { ValidationError, NotFoundError } from '../../../../core/backend/errors';
+import { formatMoney, paiseToRupees, rupeesToPaise } from '../../../../core/shared/math';
 import type { 
   Employee, 
   SalaryStructure, 
@@ -36,6 +37,123 @@ import type {
 } from '../../shared/hr.types';
 
 export class HRService {
+  private accountingColsEnsured = false;
+
+  private ensureAccountingAndExpenseColumns(): void {
+    if (this.accountingColsEnsured) return;
+    const alterStatements = [
+      `ALTER TABLE expenses ADD COLUMN employee_id INTEGER`,
+      `ALTER TABLE expenses ADD COLUMN photo_url TEXT`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN credit_paise INTEGER DEFAULT 0`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN voucher_group_id TEXT`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN party_type TEXT`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN party_id INTEGER`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN party_name TEXT`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN payment_mode TEXT`,
+      `ALTER TABLE accounting_daily_ledger ADD COLUMN narration TEXT`,
+    ];
+    for (const stmt of alterStatements) {
+      try {
+        db.prepare(stmt).run();
+      } catch {
+        // Column already exists
+      }
+    }
+    try {
+      db.prepare(`INSERT OR IGNORE INTO expense_categories (name, is_active) VALUES ('Salary', 1)`).run();
+    } catch {
+      try {
+        db.prepare(`INSERT OR IGNORE INTO expense_categories (name) VALUES ('Salary')`).run();
+      } catch {}
+    }
+    this.accountingColsEnsured = true;
+  }
+
+  private postSalaryOrAdvanceToExpensesAndAccounting(params: {
+    employeeId: number;
+    employeeName: string;
+    empCode: string;
+    amountPaise: number;
+    date: string;
+    paymentMode: string;
+    referenceId: string;
+    notes: string;
+    userId: number;
+  }): void {
+    if (params.amountPaise <= 0) return;
+    this.ensureAccountingAndExpenseColumns();
+
+    const salaryCat = db.prepare(`SELECT id FROM expense_categories WHERE LOWER(name) = 'salary' LIMIT 1`).get() as { id: number } | undefined;
+    const categoryId = salaryCat?.id || 1;
+    const normalizedMode = params.paymentMode.toLowerCase() === 'cash'
+      ? 'Cash'
+      : params.paymentMode.toLowerCase() === 'upi'
+      ? 'UPI'
+      : 'Bank';
+
+    // 1. Insert Expense row linked to employee_id under 'Salary' category
+    db.prepare(`
+      INSERT INTO expenses (
+        store_id, category_id, employee_id, vendor_name, amount_paise, gst_paise,
+        payment_method, expense_date, notes, status, created_by
+      ) VALUES (1, ?, ?, ?, ?, 0, ?, ?, ?, 'Approved', ?)
+    `).run(
+      categoryId,
+      params.employeeId,
+      `${params.employeeName} (${params.empCode})`,
+      params.amountPaise,
+      normalizedMode,
+      params.date,
+      params.notes,
+      params.userId
+    );
+
+    // 2. Post balanced double-entry rows to accounting_daily_ledger
+    const voucherGroupId = `VCH-HR-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const creditAccount = normalizedMode === 'Cash' ? 'Cash' : 'Bank';
+
+    // Row 1: Debit Expense
+    db.prepare(`
+      INSERT INTO accounting_daily_ledger (
+        store_id, date, account_type, reference_id, description,
+        debit_paise, credit_paise, voucher_group_id,
+        party_type, party_id, party_name, payment_mode, narration, created_by
+      ) VALUES (1, ?, 'Expense', ?, ?, ?, 0, ?, 'employee', ?, ?, ?, ?, ?)
+    `).run(
+      params.date,
+      params.referenceId,
+      params.notes,
+      params.amountPaise,
+      voucherGroupId,
+      params.employeeId,
+      params.employeeName,
+      normalizedMode,
+      params.notes,
+      params.userId
+    );
+
+    // Row 2: Credit Cash / Bank
+    db.prepare(`
+      INSERT INTO accounting_daily_ledger (
+        store_id, date, account_type, reference_id, description,
+        debit_paise, credit_paise, voucher_group_id,
+        party_type, party_id, party_name, payment_mode, narration, created_by
+      ) VALUES (1, ?, ?, ?, ?, 0, ?, ?, 'employee', ?, ?, ?, ?, ?)
+    `).run(
+      params.date,
+      params.referenceId,
+      params.notes,
+      creditAccount,
+      params.amountPaise,
+      voucherGroupId,
+      params.employeeId,
+      params.employeeName,
+      normalizedMode,
+      params.notes,
+      params.userId
+    );
+  }
+
   // ───────────────────────────────────────────────────────────────────────────
   // SECTION A: EMPLOYEE MASTER
   // ───────────────────────────────────────────────────────────────────────────
@@ -1248,6 +1366,19 @@ export class HRService {
         referenceNumber: `ADV-${String(advanceId).padStart(5, '0')}`,
         description: `Salary Advance (${paymentMode.toUpperCase()}): ${input.reason.trim()}`,
         createdBy: cashierId,
+      });
+
+      // 4. Record in store expenses ('Salary') and post balanced double-entry to accounting_daily_ledger
+      this.postSalaryOrAdvanceToExpensesAndAccounting({
+        employeeId: input.employee_id,
+        employeeName: emp.full_name,
+        empCode: emp.emp_code,
+        amountPaise: input.amount_paise,
+        date: advanceDate,
+        paymentMode,
+        referenceId: `ADV-${String(advanceId).padStart(5, '0')}`,
+        notes: `Salary Advance (${emp.full_name}): ${input.reason.trim()}`,
+        userId: cashierId,
       });
 
       auditLogger.log(cashierId, 'HR_CREATE_ADVANCE', { advanceId, employeeId: input.employee_id, amountPaise: input.amount_paise, paymentMode });
@@ -2669,6 +2800,19 @@ export class HRService {
         createdBy: userId,
       });
 
+      // Record in store expenses ('Salary') and post balanced double-entry to accounting_daily_ledger
+      this.postSalaryOrAdvanceToExpensesAndAccounting({
+        employeeId: item.employee_id,
+        employeeName: item.full_name,
+        empCode: item.emp_code,
+        amountPaise: item.net_salary_paise,
+        date: paymentDate,
+        paymentMode: paymentMethod,
+        referenceId: paymentRef,
+        notes: `Monthly Salary Payout (${item.month_year} - ${item.full_name}): Ref #${paymentRef}`,
+        userId,
+      });
+
       // 4. Update payroll_item status
       db.prepare(`
         UPDATE payroll_items
@@ -2691,7 +2835,7 @@ export class HRService {
         'payroll_item',
         item.id,
         'PAY',
-        `Paid ₹${(item.net_salary_paise / 100).toFixed(2)} via ${paymentMethod.toUpperCase()} (Ref: ${paymentRef}) by ${userName}`
+        `Paid ₹${formatMoney(paiseToRupees(item.net_salary_paise))} via ${paymentMethod.toUpperCase()} (Ref: ${paymentRef}) by ${userName}`
       );
 
       return db.prepare(`

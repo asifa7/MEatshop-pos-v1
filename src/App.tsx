@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { MemoryRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -29,6 +29,12 @@ import {
   Activity,
   Truck,
   MessageSquare,
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  LogOut,
 } from 'lucide-react';
 import { IPC_CHANNELS } from './core/ipc/channels';
 import { AppConfig } from './core/shared/types';
@@ -37,6 +43,7 @@ import { WhatsAppToastManager } from './modules/whatsapp/frontend/components/Wha
 import ProductGrid from './modules/billing/frontend/components/ProductGrid';
 import ProductQuickSearch from './modules/billing/frontend/components/ProductQuickSearch';
 import Cart from './modules/billing/frontend/components/Cart';
+import ExpressBillingView from './modules/billing/frontend/components/ExpressBillingView';
 import WastageCalculatorWidget from './modules/billing/frontend/components/WastageCalculatorWidget';
 import WeightEntry from './modules/billing/frontend/components/WeightEntry';
 import PaymentPanel from './modules/billing/frontend/components/PaymentPanel';
@@ -55,6 +62,7 @@ import SettingsScreen from './modules/settings/frontend/components/SettingsScree
 import { Key, AlertTriangle, Edit3, Trash2, CheckCircle2, Palette, Zap, Sparkles, Plus } from 'lucide-react';
 import { useSession, useLogout } from './modules/auth/frontend/hooks/useAuth';
 import LoginScreen from './modules/auth/frontend/components/LoginScreen';
+import { TerminalLockModal } from './modules/auth/frontend/components/TerminalLockModal';
 import { useCart } from './modules/billing/frontend/hooks/useCart';
 import { useActiveRates } from './modules/billing/frontend/hooks/useActiveRates';
 import DailyCashierPromptModal from './modules/inventory/frontend/components/DailyCashierPromptModal';
@@ -78,20 +86,22 @@ import EnterpriseLedgerView from './modules/ledger/frontend/components/Enterpris
 import SystemHealthView from './modules/system/frontend/components/SystemHealthView';
 import DemandForecastingView from './modules/inventory/frontend/components/DemandForecastingView';
 import PaymentsReceiptsView from './modules/ledger/frontend/components/PaymentsReceiptsView';
+import BankStatementReconciliationView from './modules/reconciliation/frontend/components/BankStatementReconciliationView';
 import DeliveryManagementView from './modules/delivery/frontend/components/DeliveryManagementView';
 import DeliveryOrderModal from './modules/delivery/frontend/components/DeliveryOrderModal';
 import { HomeDeliveryPromptModal } from './modules/delivery/frontend/components/HomeDeliveryPromptModal';
 import { useDeliveries } from './modules/delivery/frontend/hooks/useDelivery';
 import type { CreateDeliveryInput } from './modules/delivery/types/delivery.types';
 
-type Page = 'billing' | 'inventory' | 'purchases' | 'payments' | 'delivery' | 'products' | 'reports' | 'settings' | 'help' | 'customers' | 'ar_reports' | 'hr' | 'cashbox' | 'expenses' | 'prices' | 'ledgers' | 'health' | 'forecasting';
+type Page = 'billing' | 'inventory' | 'purchases' | 'payments' | 'delivery' | 'products' | 'reports' | 'settings' | 'help' | 'customers' | 'ar_reports' | 'hr' | 'cashbox' | 'expenses' | 'prices' | 'ledgers' | 'health' | 'forecasting' | 'reconciliation';
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
-function Sidebar({ activePage, onNavigate, theme, onToggleTheme }: {
+function Sidebar({ activePage, onNavigate, theme, onToggleTheme, onLockTerminal }: {
   activePage: Page;
   onNavigate: (page: Page) => void;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
+  onLockTerminal?: () => void;
 }) {
   const { data: heldBills } = useHeldBills();
   const heldCount = (heldBills || []).filter(b => b.status === 'held').length;
@@ -107,302 +117,259 @@ function Sidebar({ activePage, onNavigate, theme, onToggleTheme }: {
     const isPaid = Boolean(d.payment_received === 1 || d.payment_status === 'paid');
     return !(isDelivered && isPaid);
   }).length;
+
+  const { config: appearance, updateConfig: updateAppearance } = useAppearance();
+
+  // Collapsed state persisted in localStorage & appearance
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('pos_sidebar_collapsed');
+      if (stored !== null) return stored === 'true';
+      return !!appearance?.sidebarCollapsed;
+    } catch {
+      return false;
+    }
+  });
+
+  const [isHovered, setIsHovered] = useState(false);
+  const hoverExpandEnabled = appearance?.sidebarHoverExpand !== false;
+
+  // Active expanded status: expanded if not collapsed, OR if collapsed and user hovers over it with hoverExpand enabled
+  const isExpanded = !isCollapsed || (isHovered && hoverExpandEnabled);
+
+  const toggleCollapse = () => {
+    const next = !isCollapsed;
+    setIsCollapsed(next);
+    updateAppearance({ sidebarCollapsed: next });
+    try {
+      localStorage.setItem('pos_sidebar_collapsed', String(next));
+    } catch {}
+  };
+
+  const navItems = [
+    { key: 'billing' as Page, label: 'Billing / POS', icon: <ShoppingCart size={17} className="shrink-0" /> },
+    { 
+      key: 'inventory' as Page, 
+      label: 'Inventory / Stock', 
+      icon: <Package size={17} className="shrink-0" />, 
+      badge: lowStockBadgeCount > 0 ? lowStockBadgeCount : null,
+      badgeColor: 'bg-rose-500',
+      pulse: true
+    },
+    { 
+      key: 'delivery' as Page, 
+      label: 'Delivery', 
+      icon: <Truck size={17} className="shrink-0" />, 
+      badge: pendingDeliveryCount > 0 ? pendingDeliveryCount : null,
+      badgeColor: 'bg-amber-500' 
+    },
+    { key: 'purchases' as Page, label: 'Purchases', icon: <Package size={17} className="shrink-0" /> },
+    { key: 'payments' as Page, label: 'Payments & Receipts', icon: <CreditCard size={17} className="shrink-0" /> },
+    { key: 'reports' as Page, label: 'Reports / Sales', icon: <BarChart3 size={17} className="shrink-0" /> },
+    { key: 'products' as Page, label: 'Products', icon: <LayoutGrid size={17} className="shrink-0" /> },
+    { key: 'customers' as Page, label: 'Customers / CRM', icon: <Users size={17} className="shrink-0" /> },
+    { key: 'ar_reports' as Page, label: 'Credit & A/R', icon: <Landmark size={17} className="shrink-0" /> },
+    { key: 'hr' as Page, label: 'HR & Payroll', icon: <Users size={17} className="shrink-0" /> },
+    { key: 'cashbox' as Page, label: 'Cash Box & Shifts', icon: <Lock size={17} className="shrink-0" /> },
+    { key: 'expenses' as Page, label: 'Expenses', icon: <Receipt size={17} className="shrink-0" /> },
+    { key: 'prices' as Page, label: 'Market Rates', icon: <TrendingUp size={17} className="shrink-0" /> },
+    { key: 'ledgers' as Page, label: 'Daily Ledgers', icon: <BookOpen size={17} className="shrink-0" /> },
+    { key: 'reconciliation' as Page, label: 'Bank Reconciliation', icon: <RefreshCw size={17} className="shrink-0" /> },
+    { key: 'health' as Page, label: 'Diagnostics', icon: <Activity size={17} className="shrink-0" /> },
+    { key: 'forecasting' as Page, label: 'Demand Forecasting', icon: <TrendingUp size={17} className="shrink-0" /> },
+    { key: 'settings' as Page, label: 'Settings', icon: <SettingsIcon size={17} className="shrink-0" /> },
+    { key: 'help' as Page, label: 'System Help', icon: <HelpCircle size={17} className="shrink-0" /> },
+  ];
+
   return (
-    <aside className="w-48 bg-surface-panel text-text-primary flex flex-col justify-between border-r border-border-subtle h-full max-h-screen flex-shrink-0 select-none overflow-hidden">
-      <div className="flex flex-col flex-1 min-h-0 overflow-y-auto">
-        {/* Brand Header */}
-        <div className="p-3 flex items-center gap-2 border-b border-border-subtle flex-shrink-0 sticky top-0 bg-surface-panel z-10">
-          <div className="w-7 h-7 rounded-lg bg-brand-500 flex items-center justify-center font-bold text-xs text-white shadow-subtle shrink-0">
-            M
-          </div>
-          <div className="min-w-0 flex-1">
-            <h1 className="font-bold text-xs tracking-tight text-text-primary truncate">MEAT SHOP POS</h1>
-            <p className="text-[8.5px] text-brand-500 font-bold uppercase tracking-wider truncate">Enterprise Carbon</p>
-          </div>
-        </div>
-        {/* Navigation Items */}
-        {unreviewedOversoldCount > 0 && (
-          <div className="mx-2 mt-1.5 px-2 py-1.5 bg-rose-500/10 border border-rose-500/20 rounded-lg flex items-center gap-1.5 text-rose-500 shadow-sm cursor-pointer hover:bg-rose-500/20 transition-colors flex-shrink-0" onClick={() => onNavigate('inventory')}>
-            <AlertTriangle size={13} className="animate-pulse shrink-0" />
-            <span className="text-[9.5px] font-bold leading-tight truncate">{unreviewedOversoldCount} oversold item(s)</span>
-          </div>
-        )}
-        <nav className="p-1.5 space-y-0.5">
-          <button
-            onClick={() => onNavigate('billing')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'billing'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <ShoppingCart size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Billing / POS</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('inventory')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'inventory'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Package size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Inventory / Stock</span>
-            {lowStockBadgeCount > 0 && (
-              <span className="bg-rose-500 text-white text-[9px] font-bold px-1.5 py-0.2 rounded-full shadow-sm animate-pulse">
-                {lowStockBadgeCount}
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => onNavigate('delivery')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'delivery'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Truck size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Delivery</span>
-            {pendingDeliveryCount > 0 && (
-              <span className="bg-amber-500 text-white text-[9px] font-bold px-1.5 py-0.2 rounded-full shadow-sm">
-                {pendingDeliveryCount}
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => onNavigate('purchases')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'purchases'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Package size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Purchases</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('payments')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'payments'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <CreditCard size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Payments & Receipts</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('reports')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'reports'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <BarChart3 size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Reports / Sales</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('products')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'products'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <LayoutGrid size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Products</span>
-          </button>
-
-
-          <button
-            onClick={() => onNavigate('customers')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'customers'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Users size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Customers / CRM</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('ar_reports')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'ar_reports'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Landmark size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Credit & A/R</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('hr')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'hr'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Users size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">HR & Payroll</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('cashbox')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'cashbox'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Lock size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Cash Box & Shifts</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('expenses')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'expenses'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Receipt size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Expenses</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('prices')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'prices'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <TrendingUp size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Market Rates</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('ledgers')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'ledgers'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <BookOpen size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Daily Ledgers</span>
-          </button>
-
-
-
-          <button
-            onClick={() => onNavigate('health')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'health'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <Activity size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Diagnostics</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('forecasting')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'forecasting'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <TrendingUp size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Demand Forecasting</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('settings')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'settings'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <SettingsIcon size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">Settings</span>
-          </button>
-
-          <button
-            onClick={() => onNavigate('help')}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
-              activePage === 'help'
-                ? 'bg-brand-500 text-white shadow-subtle'
-                : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-            }`}
-          >
-            <HelpCircle size={15} className="shrink-0" />
-            <span className="flex-1 text-left truncate">System Help</span>
-          </button>
-        </nav>
-
-        {/* Held Bills Badge */}
-        {heldCount > 0 && (
-          <div className="mx-2 px-2 py-1.5 bg-amber-950/40 border border-amber-800/40 rounded-lg mt-1">
-            <div className="flex items-center gap-1.5 text-[10px] text-amber-400 font-bold">
-              <Pause size={13} className="shrink-0" />
-              <span className="truncate">{heldCount} held bill{heldCount !== 1 ? 's' : ''}</span>
+    <div
+      className={`relative flex-shrink-0 h-full max-h-screen select-none ${
+        isCollapsed ? 'w-16' : 'w-52'
+      } transition-[width] duration-200 ease-in-out`}
+    >
+      <aside
+        onMouseEnter={() => {
+          if (isCollapsed && hoverExpandEnabled) setIsHovered(true);
+        }}
+        onMouseLeave={() => {
+          if (isCollapsed && hoverExpandEnabled) setIsHovered(false);
+        }}
+        className={`absolute inset-y-0 left-0 bg-surface-panel text-text-primary flex flex-col justify-between border-r border-border-subtle h-full max-h-screen transition-all duration-200 ease-in-out ${
+          isExpanded
+            ? 'w-52 shadow-2xl z-40'
+            : 'w-16 z-20'
+        }`}
+      >
+        <div className="flex flex-col flex-1 min-h-0 overflow-y-auto">
+          {/* Brand Header */}
+          <div className="p-2.5 flex items-center justify-between border-b border-border-subtle flex-shrink-0 sticky top-0 bg-surface-panel z-10">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="w-8 h-8 rounded-xl bg-brand-500 flex items-center justify-center font-black text-sm text-white shadow-subtle shrink-0">
+                M
+              </div>
+              {isExpanded && (
+                <div className="min-w-0 flex-1 animate-in fade-in duration-150">
+                  <h1 className="font-black text-xs tracking-tight text-text-primary truncate">MEAT SHOP POS</h1>
+                  <p className="text-[9px] text-brand-500 font-extrabold uppercase tracking-wider truncate">Enterprise Carbon</p>
+                </div>
+              )}
             </div>
-          </div>
-        )}
-      </div>
 
-      {/* Sidebar Footer */}
-      <div className="p-2 border-t border-border-subtle space-y-1.5 flex-shrink-0 bg-surface-panel z-10">
-        <button
-          onClick={onToggleTheme}
-          className="w-full flex items-center justify-between px-2 py-1.5 bg-surface-card hover:bg-surface-hover rounded-lg border border-border-subtle text-[10px] font-medium text-text-secondary hover:text-text-primary transition-colors"
-        >
-          <span className="flex items-center gap-1.5 truncate">
-            {theme === 'dark' ? <Sun size={11} className="text-amber-400 shrink-0" /> : <Moon size={11} className="shrink-0" />}
-            <span className="truncate">{theme === 'dark' ? 'Dark Carbon' : 'Light Mode'}</span>
-          </span>
-          <span className="font-mono text-[8.5px] opacity-60 ml-1">Ctrl+T</span>
-        </button>
-
-        {session && (
-          <div className="flex items-center justify-between p-2 bg-surface-card rounded-lg border border-border-subtle text-[10px] font-medium transition-colors shadow-xs">
-            <div className="flex flex-col min-w-0 mr-1">
-              <span className="text-text-primary font-bold leading-tight truncate">{session.username}</span>
-              <span className="text-[8.5px] text-brand-500 font-bold uppercase tracking-wider truncate">{session.role}</span>
-            </div>
+            {/* Collapse/Expand Toggle button (Brave style) */}
             <button
-              onClick={() => logoutMutation.mutate()}
-              className="px-2 py-0.5 bg-red-500 border-none hover:bg-red-600 active:bg-red-700 text-white rounded text-[8.5px] font-bold uppercase transition-all shadow-sm cursor-pointer shrink-0"
+              type="button"
+              onClick={toggleCollapse}
+              className="p-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors cursor-pointer shrink-0"
+              title={isCollapsed ? "Pin sidebar expanded" : "Collapse sidebar to icons (Brave style)"}
             >
-              Sign Out
+              {isCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
             </button>
           </div>
-        )}
 
-        <div className="flex items-center gap-1.5 text-[9px] text-text-muted px-1">
-          <Terminal size={11} className="shrink-0" />
-          <span className="truncate">Local Engine Active</span>
+          {/* Navigation Items */}
+          {unreviewedOversoldCount > 0 && (
+            <div
+              className={`mx-2 mt-1.5 px-2 py-1.5 bg-rose-500/10 border border-rose-500/20 rounded-lg flex items-center gap-1.5 text-rose-500 shadow-sm cursor-pointer hover:bg-rose-500/20 transition-colors flex-shrink-0 ${
+                !isExpanded ? 'justify-center' : ''
+              }`}
+              onClick={() => onNavigate('inventory')}
+              title={`${unreviewedOversoldCount} oversold item(s)`}
+            >
+              <AlertTriangle size={14} className="animate-pulse shrink-0" />
+              {isExpanded && (
+                <span className="text-[10.5px] font-bold leading-tight truncate">
+                  {unreviewedOversoldCount} oversold item(s)
+                </span>
+              )}
+            </div>
+          )}
+
+          <nav className="p-1.5 space-y-0.5">
+            {navItems.map((item) => {
+              const isActive = activePage === item.key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => onNavigate(item.key)}
+                  title={!isExpanded ? item.label : undefined}
+                  className={`w-full flex items-center rounded-xl transition-all duration-150 cursor-pointer ${
+                    isExpanded ? 'gap-2.5 px-3 py-2 text-[13px] font-bold' : 'justify-center p-2.5'
+                  } ${
+                    isActive
+                      ? 'bg-brand-500 text-white shadow-subtle'
+                      : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
+                  }`}
+                >
+                  <div className="relative flex items-center justify-center shrink-0">
+                    {item.icon}
+                    {!isExpanded && item.badge && (
+                      <span className={`absolute -top-1 -right-1.5 w-2 h-2 rounded-full ${item.badgeColor || 'bg-brand-500'} ${item.pulse ? 'animate-pulse' : ''}`} />
+                    )}
+                  </div>
+                  {isExpanded && (
+                    <>
+                      <span className="flex-1 text-left truncate">{item.label}</span>
+                      {item.badge && (
+                        <span className={`${item.badgeColor || 'bg-brand-500'} text-white text-[9.5px] font-black px-1.5 py-0.5 rounded-full shadow-sm ${item.pulse ? 'animate-pulse' : ''}`}>
+                          {item.badge}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Held Bills Badge */}
+          {heldCount > 0 && (
+            <div className={`mx-2 px-2 py-1.5 bg-amber-950/40 border border-amber-800/40 rounded-lg mt-1 ${!isExpanded ? 'flex justify-center' : ''}`}>
+              <div className="flex items-center gap-1.5 text-[10px] text-amber-400 font-bold" title={`${heldCount} held bill(s)`}>
+                <Pause size={13} className="shrink-0" />
+                {isExpanded && <span className="truncate">{heldCount} held bill{heldCount !== 1 ? 's' : ''}</span>}
+              </div>
+            </div>
+          )}
         </div>
-      </div>
-    </aside>
+
+        {/* Sidebar Footer */}
+        <div className="p-2 border-t border-border-subtle space-y-1.5 flex-shrink-0 bg-surface-panel z-10">
+          <button
+            type="button"
+            onClick={onToggleTheme}
+            className={`w-full flex items-center rounded-lg border border-border-subtle text-text-secondary hover:text-text-primary bg-surface-card hover:bg-surface-hover transition-colors ${
+              isExpanded ? 'justify-between px-2.5 py-1.5 text-[11px] font-bold' : 'justify-center p-2'
+            }`}
+            title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+          >
+            <span className="flex items-center gap-1.5 truncate">
+              {theme === 'dark' ? <Sun size={13} className="text-amber-400 shrink-0" /> : <Moon size={13} className="shrink-0" />}
+              {isExpanded && <span className="truncate">{theme === 'dark' ? 'Dark Carbon' : 'Light Mode'}</span>}
+            </span>
+            {isExpanded && <span className="font-mono text-[9px] opacity-60 ml-1">Ctrl+T</span>}
+          </button>
+
+          {session && (
+            <div className={`flex items-center bg-surface-card rounded-lg border border-border-subtle transition-colors shadow-xs ${
+              isExpanded ? 'justify-between p-2 text-xs' : 'justify-center p-2'
+            }`}>
+              {isExpanded ? (
+                <>
+                  <div className="flex flex-col min-w-0 mr-1">
+                    <span className="text-text-primary font-bold text-xs leading-tight truncate">{session.username}</span>
+                    <span className="text-[9px] text-brand-500 font-black uppercase tracking-wider truncate">{session.role}</span>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={onLockTerminal}
+                      className="p-1 hover:bg-surface-hover text-text-secondary hover:text-text-primary rounded-lg transition-colors cursor-pointer"
+                      title="Lock Register (Ctrl+L)"
+                    >
+                      <Lock size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => logoutMutation.mutate()}
+                      className="px-2 py-1 bg-red-500 hover:bg-red-600 active:bg-red-700 text-white rounded-lg text-[9px] font-black uppercase transition-all shadow-xs cursor-pointer shrink-0"
+                    >
+                      Sign Out
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-col items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={onLockTerminal}
+                    className="p-1 hover:bg-surface-hover text-text-secondary hover:text-text-primary rounded-lg transition-colors cursor-pointer"
+                    title="Lock Register (Ctrl+L)"
+                  >
+                    <Lock size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => logoutMutation.mutate()}
+                    className="p-1 hover:bg-red-500 hover:text-white text-text-secondary rounded-lg transition-colors cursor-pointer"
+                    title={`Sign Out (${session.username})`}
+                  >
+                    <LogOut size={14} />
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {isExpanded && (
+            <div className="flex items-center gap-1.5 text-[9.5px] text-text-muted px-1">
+              <Terminal size={11} className="shrink-0" />
+              <span className="truncate font-mono">Local Engine Active</span>
+            </div>
+          )}
+        </div>
+      </aside>
+    </div>
   );
 }
 
@@ -463,6 +430,9 @@ function BillingView() {
       return res.data;
     })
   });
+
+  const { config: appearanceConfig } = useAppearance();
+  const isExpressBilling = appearanceConfig.billingStyle === 'express';
 
   const [showWeightEntry, setShowWeightEntry] = useState(false);
   const [showPaymentPanel, setShowPaymentPanel] = useState(false);
@@ -862,10 +832,11 @@ function BillingView() {
     }
 
     // 3b. Automatic Background WhatsApp Dispatch (Option B)
-    // If customer has a mobile number attached, dispatch silently in background with 0 clicks.
+    // If customer has a valid 10-digit mobile number attached, dispatch silently in background with 0 clicks.
     // If no mobile number is attached, skip silently (no error, no modal, no disturbance).
     const targetCustomerPhone = customer?.whatsapp || customer?.phone || customer?.phone2 || '';
-    if (targetCustomerPhone && targetCustomerPhone.trim()) {
+    const cleanCustomerDigits = targetCustomerPhone.replace(/[^0-9]/g, '');
+    if (cleanCustomerDigits.length >= 10 && invoice?.invoice?.id) {
       window.api.invoke(IPC_CHANNELS.BILLING.SEND_WHATSAPP_BILL, {
         invoice_id: invoice.invoice.id,
         customPhone: targetCustomerPhone.trim(),
@@ -932,7 +903,8 @@ function BillingView() {
       queryClient.invalidateQueries({ queryKey: ['deliveries'] });
 
       // Automatically dispatch WhatsApp bill if phone was provided
-      if (details.customerPhone && details.customerPhone.trim()) {
+      const deliveryCleanDigits = (details.customerPhone || '').replace(/[^0-9]/g, '');
+      if (deliveryCleanDigits.length >= 10 && pendingHomeDeliveryInvoice?.invoice?.id) {
         window.api.invoke(IPC_CHANNELS.BILLING.SEND_WHATSAPP_BILL, {
           invoice_id: pendingHomeDeliveryInvoice.invoice.id,
           customPhone: details.customerPhone.trim(),
@@ -1036,16 +1008,9 @@ function BillingView() {
 
         // Auto-load linked customer or clear for walk-in (no forced selection)
         if (lastCompletedInvoice.invoice.customer_id) {
-          try {
-            const custRes = await window.api.invoke('customers:get', { customer_id: lastCompletedInvoice.invoice.customer_id });
-            if (custRes.success && custRes.data) {
-              setCustomer(custRes.data);
-              setCustomerId(custRes.data.id);
-            }
-          } catch (e) {}
+          await cart.linkCustomer(lastCompletedInvoice.invoice.customer_id);
         } else {
-          setCustomer(null);
-          setCustomerId(null);
+          await cart.linkCustomer(null);
         }
 
         queryClient.invalidateQueries({ queryKey: ['billing', 'held'] });
@@ -1102,8 +1067,30 @@ function BillingView() {
           <span>{toastMessage}</span>
         </div>
       )}
-      {/* Center Column: Link Customer (Top) + Product Quick Search (Second) + Cart Page (Main) */}
-      <div className="flex-1 flex flex-col min-w-0 border-r border-border-subtle bg-surface-app overflow-hidden">
+      {isExpressBilling ? (
+        <ExpressBillingView
+          customer={customer}
+          onCustomerChange={handleCustomerChange}
+          lastCompletedInvoice={lastCompletedInvoice}
+          onReprintLast={handleReprintClick}
+          onEditLast={() => {
+            setEditPassword('');
+            setEditError('');
+            setShowEditPasswordModal(true);
+          }}
+          onDispatchDelivery={() => {
+            if (lastCompletedInvoice) setFlowBDeliveryInvoice(lastCompletedInvoice);
+          }}
+          onOpenHeldBills={() => setShowHeldBills(true)}
+          onCompleteSale={handleSaleComplete}
+          isDeliveryOrder={isDeliveryOrder}
+          onToggleDelivery={() => setIsDeliveryOrder(prev => !prev)}
+          deliveryChargePaise={isDeliveryOrder ? (deliveryConfig?.delivery_charge_paise || 0) : 0}
+        />
+      ) : (
+        <>
+          {/* Center Column: Link Customer (Top) + Product Quick Search (Second) + Cart Page (Main) */}
+          <div className="flex-1 flex flex-col min-w-0 border-r border-border-subtle bg-surface-app overflow-hidden">
         {/* 1. Link Customer Account Bar (Top) */}
         <div className="px-3.5 py-2 border-b border-border-subtle bg-surface-panel flex-shrink-0">
           <label className="block text-[9px] uppercase font-extrabold tracking-wider text-brand-500 mb-1 select-none flex items-center gap-1.5">
@@ -1186,7 +1173,7 @@ function BillingView() {
             selectedPaymentMethod={paymentMethod}
             onSelectPaymentMethod={setPaymentMethod}
             skipPaymentConfirmation={configQuery.data?.billingSettings?.skipPaymentConfirmation ?? false}
-            defaultPaymentMethod={configQuery.data?.billingSettings?.defaultPaymentMethod ?? 'cash'}
+            defaultPaymentMethod={(configQuery.data?.billingSettings?.defaultPaymentMethod as any) ?? 'cash'}
             deliveryChargePaise={isDeliveryOrder ? (deliveryConfig?.delivery_charge_paise || 0) : 0}
             onOpenDeliveryModal={() => {
               console.log('[APP-DELIVERY-TOGGLE]', 'before:', isDeliveryOrder);
@@ -1403,6 +1390,8 @@ function BillingView() {
           )}
         </div>
       </div>
+      </>
+      )}
 
       {/* Edit Password Modal */}
       {showEditPasswordModal && (
@@ -1543,14 +1532,9 @@ function BillingView() {
             try {
               const res = await window.api.invoke('billing:get-invoice', { invoice_id: invoiceId });
               if (res.success && res.data?.invoice?.customer_id) {
-                const custRes = await window.api.invoke('customers:get', { customer_id: res.data.invoice.customer_id });
-                if (custRes.success && custRes.data) {
-                  setCustomer(custRes.data);
-                  setCustomerId(custRes.data.id);
-                }
+                await cart.linkCustomer(res.data.invoice.customer_id);
               } else {
-                setCustomer(null);
-                setCustomerId(null);
+                await cart.linkCustomer(null);
               }
             } catch (e) {}
             setTimeout(focusEnterBillBar, 50);
@@ -1728,12 +1712,12 @@ function HelpView({ sysInfo }: { sysInfo: any }) {
                 <td className="py-2 text-right"><kbd className="bg-surface-card border border-border-subtle px-1.5 py-0.5 rounded font-mono text-[10px] text-text-primary">Ctrl+2</kbd></td>
               </tr>
               <tr className="border-b border-border-subtle/30">
-                <td className="py-2">Go to Reports / Sales</td>
-                <td className="py-2 text-right"><kbd className="bg-surface-card border border-border-subtle px-1.5 py-0.5 rounded font-mono text-[10px] text-text-primary">Ctrl+4</kbd></td>
-              </tr>
-              <tr className="border-b border-border-subtle/30">
                 <td className="py-2">Go to Products Manager</td>
                 <td className="py-2 text-right"><kbd className="bg-surface-card border border-border-subtle px-1.5 py-0.5 rounded font-mono text-[10px] text-text-primary">Ctrl+3</kbd></td>
+              </tr>
+              <tr className="border-b border-border-subtle/30">
+                <td className="py-2">Go to Reports / Sales</td>
+                <td className="py-2 text-right"><kbd className="bg-surface-card border border-border-subtle px-1.5 py-0.5 rounded font-mono text-[10px] text-text-primary">Ctrl+4</kbd></td>
               </tr>
               <tr className="border-b border-border-subtle/30">
                 <td className="py-2">Go to Settings Manager</td>
@@ -1835,6 +1819,8 @@ function MainLayout() {
                       ? 'expenses'
                       : location.pathname === '/prices'
                         ? 'prices'
+                        : location.pathname === '/reconciliation'
+                          ? 'reconciliation'
                         : location.pathname === '/ledgers'
                           ? 'ledgers'
                           : location.pathname === '/health'
@@ -1909,7 +1895,7 @@ function MainLayout() {
     })
   });
 
-  useQuery<AppConfig>({
+  const { data: configData } = useQuery<AppConfig>({
     queryKey: ['config'],
     queryFn: () => window.api.invoke(IPC_CHANNELS.CONFIG.GET).then((res: any) => {
       if (!res.success) throw new Error(res.error.message);
@@ -1918,6 +1904,50 @@ function MainLayout() {
   });
 
   const { data: session, isLoading: isSessionLoading } = useSession();
+  const [isTerminalLocked, setIsTerminalLocked] = useState(false);
+  const lastActivityRef = useRef<number>(Date.now());
+
+  // Inactivity / Idle timeout security tracker (default 12 hours or configured setting)
+  useEffect(() => {
+    if (!session) return;
+
+    const resetActivity = () => {
+      lastActivityRef.current = Date.now();
+    };
+
+    const handleGlobalKey = (e: KeyboardEvent) => {
+      resetActivity();
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        setIsTerminalLocked(true);
+      }
+    };
+
+    window.addEventListener('mousemove', resetActivity);
+    window.addEventListener('mousedown', resetActivity);
+    window.addEventListener('keydown', handleGlobalKey);
+    window.addEventListener('touchstart', resetActivity);
+
+    const interval = setInterval(() => {
+      const storedHours = localStorage.getItem('pos_idle_timeout_hours');
+      const hours = storedHours !== null ? Number(storedHours) : (configData?.billingSettings?.idleTimeoutHours ?? 12);
+      if (hours > 0) {
+        const timeoutMs = hours * 3600 * 1000;
+        if (Date.now() - lastActivityRef.current >= timeoutMs) {
+          setIsTerminalLocked(true);
+        }
+      }
+    }, 30_000);
+
+    return () => {
+      window.removeEventListener('mousemove', resetActivity);
+      window.removeEventListener('mousedown', resetActivity);
+      window.removeEventListener('keydown', handleGlobalKey);
+      window.removeEventListener('touchstart', resetActivity);
+      clearInterval(interval);
+    };
+  }, [session, configData]);
+
   const [isDailyPromptOpen, setIsDailyPromptOpen] = useState(() => {
     const today = new Date().toISOString().split('T')[0];
     const lastPromptDate = localStorage.getItem('pos_daily_cashier_prompt_date');
@@ -1949,6 +1979,16 @@ function MainLayout() {
 
   return (
     <div className="flex h-full w-full bg-surface-app text-text-primary overflow-hidden font-sans">
+      <TerminalLockModal
+        isOpen={isTerminalLocked}
+        session={session}
+        shopName={configData?.shopInfo?.name}
+        onUnlock={() => {
+          lastActivityRef.current = Date.now();
+          setIsTerminalLocked(false);
+        }}
+      />
+
       <DailyCashierPromptModal
         isOpen={isDailyPromptOpen}
         onClose={handleCloseDailyPrompt}
@@ -1959,6 +1999,7 @@ function MainLayout() {
         onNavigate={handleNavigate}
         theme={theme}
         onToggleTheme={handleToggleTheme}
+        onLockTerminal={() => setIsTerminalLocked(true)}
       />
 
       <div className="flex-1 flex flex-col min-w-0 h-full">
@@ -1980,6 +2021,7 @@ function MainLayout() {
               <Route path="/ledgers" element={<EnterpriseLedgerView />} />
               <Route path="/health" element={<SystemHealthView />} />
               <Route path="/forecasting" element={<DemandForecastingView />} />
+              <Route path="/reconciliation" element={<BankStatementReconciliationView />} />
               <Route path="/settings" element={<SettingsScreen />} />
               <Route path="/help" element={<HelpView sysInfo={sysInfoQuery.data} />} />
             </Routes>

@@ -415,6 +415,9 @@ export function installBrowserMock(): void {
             case 'system:log':
               data = true;
               break;
+            case 'system:restore-emergency-backup':
+              data = { success: true, backupFile: 'backup-mock.db', integrity: 'ok' };
+              break;
             case 'billing:get-variants':
               data = mockVariants;
               break;
@@ -659,6 +662,29 @@ export function installBrowserMock(): void {
               break;
             }
 
+            case 'cashbox:get-payment-methods': {
+              data = [
+                { id: 1, method_key: 'cash', display_name: 'Cash', method_type: 'CASH', is_enabled: 1, sort_order: 1 },
+                { id: 2, method_key: 'paytm', display_name: 'Paytm', method_type: 'UPI', is_enabled: 1, sort_order: 2 },
+                { id: 3, method_key: 'gpay', display_name: 'Google Pay', method_type: 'UPI', is_enabled: 1, sort_order: 3 },
+                { id: 4, method_key: 'phonepe', display_name: 'PhonePe', method_type: 'UPI', is_enabled: 1, sort_order: 4 },
+                { id: 5, method_key: 'card', display_name: 'Card', method_type: 'CARD', is_enabled: 1, sort_order: 5 },
+                { id: 6, method_key: 'other', display_name: 'Other', method_type: 'OTHER', is_enabled: 1, sort_order: 6 },
+              ];
+              break;
+            }
+            case 'cashbox:save-payment-method': {
+              data = [
+                { id: 1, method_key: 'cash', display_name: 'Cash', method_type: 'CASH', is_enabled: 1, sort_order: 1 },
+                { id: 2, method_key: 'paytm', display_name: 'Paytm', method_type: 'UPI', is_enabled: 1, sort_order: 2 },
+                { id: 3, method_key: 'gpay', display_name: 'Google Pay', method_type: 'UPI', is_enabled: 1, sort_order: 3 },
+                { id: 4, method_key: 'phonepe', display_name: 'PhonePe', method_type: 'UPI', is_enabled: 1, sort_order: 4 },
+                { id: 5, method_key: 'card', display_name: 'Card', method_type: 'CARD', is_enabled: 1, sort_order: 5 },
+                { id: 6, method_key: 'other', display_name: 'Other', method_type: 'OTHER', is_enabled: 1, sort_order: 6 },
+              ];
+              break;
+            }
+
             // ─── Expenses Mock ──────────────────────────────────────────────────
             case 'expenses:get-categories': {
               data = mockExpenseCategories.filter(c => c.is_active === 1);
@@ -710,18 +736,56 @@ export function installBrowserMock(): void {
             }
 
             case 'inventory:get-stock':
-              data = mockVariants.map(v => ({
-                id: v.id,
-                product_name: v.product_name,
-                variant_name: v.variant_name,
-                category: v.category,
-                quantity_grams: v.unit_type === 'weight' ? 50000 : null,
-                quantity_units: v.unit_type === 'piece' ? 120 : null,
-                safety_threshold_grams: v.unit_type === 'weight' ? 5000 : null,
-                safety_threshold_units: v.unit_type === 'piece' ? 10 : null,
-                unit_type: v.unit_type
-              }));
+              data = mockVariants
+                .filter((v: any) => {
+                  const parent = mockAdminProducts.find((p: any) => p.id === v.product_id);
+                  const trackInInv = v.track_in_inventory !== undefined 
+                    ? v.track_in_inventory 
+                    : (parent?.track_in_inventory !== undefined ? parent.track_in_inventory : 1);
+                  return trackInInv === 1;
+                })
+                .map((v: any) => {
+                  const parent = mockAdminProducts.find((p: any) => p.id === v.product_id);
+                  const trackInInv = v.track_in_inventory !== undefined 
+                    ? v.track_in_inventory 
+                    : (parent?.track_in_inventory !== undefined ? parent.track_in_inventory : 1);
+                  return {
+                    id: v.id,
+                    product_variant_id: v.id,
+                    product_name: v.product_name,
+                    variant_name: v.variant_name,
+                    category: v.category,
+                    product_code: v.product_code || (parent ? parent.product_code : ''),
+                    quantity_grams: v.unit_type === 'weight' ? 50000 : null,
+                    quantity_units: v.unit_type === 'piece' ? 120 : null,
+                    safety_threshold_grams: v.unit_type === 'weight' ? 5000 : null,
+                    safety_threshold_units: v.unit_type === 'piece' ? 10 : null,
+                    unit_type: v.unit_type,
+                    track_in_inventory: trackInInv,
+                    is_inventory_tracked: trackInInv,
+                  };
+                });
               break;
+            case 'inventory:get-sidebar-summary': {
+              const trackedList = mockVariants.filter(v => {
+                const parent = mockAdminProducts.find((p: any) => p.id === v.product_id);
+                const trackInInv = (v as any).track_in_inventory !== undefined 
+                  ? (v as any).track_in_inventory 
+                  : (parent?.track_in_inventory !== undefined ? parent.track_in_inventory : 1);
+                return trackInInv === 1;
+              });
+              data = {
+                statusCounts: {
+                  ok: trackedList.length,
+                  low: 0,
+                  critical: 0,
+                  total: trackedList.length,
+                },
+                needsAttention: [],
+                recentMovements: [],
+              };
+              break;
+            }
             case 'inventory:get-txn-history':
               data = [];
               break;
@@ -1040,6 +1104,28 @@ export function installBrowserMock(): void {
               data = { success: true };
               break;
             }
+            case 'products:update-tracking-mode': {
+              const { id, trackInInventory } = args[0] || {};
+              const val = trackInInventory ? 1 : 0;
+              const p = mockAdminProducts.find((x: any) => x.id === id);
+              if (p) p.track_in_inventory = val;
+              const v: any = mockVariants.find((x: any) => x.product_id === id || x.id === id);
+              if (v) v.track_in_inventory = val;
+              data = { success: true };
+              break;
+            }
+            case 'products:bulk-update-tracking-mode': {
+              const { ids, trackInInventory } = args[0] || {};
+              const val = trackInInventory ? 1 : 0;
+              for (const id of (ids || [])) {
+                const p = mockAdminProducts.find((x: any) => x.id === id);
+                if (p) p.track_in_inventory = val;
+                const v: any = mockVariants.find((x: any) => x.product_id === id || x.id === id);
+                if (v) v.track_in_inventory = val;
+              }
+              data = { updatedCount: (ids || []).length };
+              break;
+            }
             case 'products:bulk-import': {
               const rows = args[0]?.rows || [];
               let createdCount = 0;
@@ -1196,6 +1282,11 @@ export function installBrowserMock(): void {
             }
             case 'auth:get-session': {
               data = mockSessionUser;
+              break;
+            }
+            case 'auth:verify-password': {
+              const pass = args[0]?.password || args[0] || '';
+              data = pass === 'admin123' || pass === 'cashier123';
               break;
             }
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { 
   Lock, 
   Unlock, 
@@ -8,7 +8,6 @@ import {
   AlertTriangle, 
   History, 
   Search, 
-  FileText, 
   RefreshCw, 
   Plus, 
   Trash2, 
@@ -18,10 +17,12 @@ import {
   X, 
   DollarSign, 
   CreditCard, 
-  Smartphone
+  Smartphone,
+  Settings
 } from 'lucide-react';
 import { useCashBox, useShiftHistory, useShiftDetails, type ShiftHistoryFilter } from '../hooks/useCashBox';
 import type { ShiftCashMovement, ShiftMovementType, ShiftCorrection } from '../../../../core/types/enterprise_types';
+import { formatMoney as sharedFormatMoney } from '../../../../core/shared/math';
 
 const DENOMINATIONS = [
   { key: '500-note', value: 500, type: 'Note', label: '₹500 Note' },
@@ -38,9 +39,56 @@ const DENOMINATIONS = [
 ] as const;
 
 type Counts = Record<string, number>;
-const emptyCounts = (): Counts => Object.fromEntries(DENOMINATIONS.map(d => [d.key, 0]));
-const totalPaise = (counts: Counts) => DENOMINATIONS.reduce((sum, d) => sum + d.value * (counts[d.key] || 0) * 100, 0);
-const formatMoney = (paise = 0) => `₹${(paise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const emptyCounts = (): Counts => ({
+  ...Object.fromEntries(DENOMINATIONS.map(d => [d.key, 0])),
+  coins: 0,
+});
+const totalPaise = (counts: Counts) => {
+  const denoms = DENOMINATIONS.reduce((sum, d) => sum + d.value * (counts[d.key] || 0) * 100, 0);
+  const looseCoinsPaise = Math.round((Number(counts.coins) || 0) * 100);
+  return denoms + looseCoinsPaise;
+};
+const formatMoney = (paise = 0) => sharedFormatMoney(paise);
+
+function parseShiftTimestamp(ts?: string | null): Date | null {
+  if (!ts) return null;
+  const s = String(ts).trim();
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s)
+    ? s.replace(' ', 'T') + 'Z'
+    : s;
+  const d = new Date(normalized);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function formatShiftDateTime(ts?: string | null): string {
+  const d = parseShiftTimestamp(ts);
+  if (!d) return '—';
+  return d.toLocaleString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
+function formatShiftTime(ts?: string | null): string {
+  const d = parseShiftTimestamp(ts);
+  if (!d) return '—';
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+}
+
+function isTimestampFromPreviousDay(ts?: string | null): boolean {
+  const d = parseShiftTimestamp(ts);
+  if (!d) return false;
+  const now = new Date();
+  return (
+    d.getFullYear() !== now.getFullYear() ||
+    d.getMonth() !== now.getMonth() ||
+    d.getDate() !== now.getDate()
+  );
+}
 
 /* ─── Denomination Counter Component ────────────────────────────────────────── */
 function DenominationCounter({ 
@@ -53,13 +101,31 @@ function DenominationCounter({
   title?: string;
 }) {
   const total = totalPaise(counts);
+  const [coinsInput, setCoinsInput] = useState<string>(() => (counts.coins ? String(counts.coins) : ''));
+
+  useEffect(() => {
+    if ((counts.coins === 0 || counts.coins === undefined) && coinsInput !== '' && coinsInput !== '0') {
+      setCoinsInput('');
+    } else if (counts.coins && parseFloat(coinsInput || '0') !== counts.coins) {
+      setCoinsInput(String(counts.coins));
+    }
+  }, [counts.coins]);
 
   const handleCountChange = (key: string, val: string) => {
     const num = Math.max(0, Math.floor(Number(val) || 0));
     setCounts({ ...counts, [key]: num });
   };
 
-  const handleClear = () => setCounts(emptyCounts());
+  const handleCoinsChange = (val: string) => {
+    setCoinsInput(val);
+    const num = Math.max(0, parseFloat(val) || 0);
+    setCounts({ ...counts, coins: num });
+  };
+
+  const handleClear = () => {
+    setCoinsInput('');
+    setCounts(emptyCounts());
+  };
 
   return (
     <div className="bg-surface-card border border-border-subtle rounded-2xl p-4 shadow-sm space-y-3">
@@ -76,7 +142,7 @@ function DenominationCounter({
         </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[260px] overflow-y-auto pr-1">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {/* Notes Section */}
         <div className="space-y-1.5">
           <span className="text-[10px] font-bold uppercase text-text-muted tracking-wider">Currency Notes</span>
@@ -125,6 +191,27 @@ function DenominationCounter({
               </span>
             </div>
           ))}
+
+          {/* Direct Total Coins entry after ₹1 Coin */}
+          <div className="flex items-center justify-between gap-2 p-1.5 rounded-xl bg-surface-panel/60 border border-border-subtle/40 text-xs">
+            <span className="font-bold font-mono w-16 text-text-primary" title="Total Coins Amount">Coins</span>
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] text-text-muted font-bold font-mono">₹</span>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                value={coinsInput}
+                placeholder="0"
+                onChange={e => handleCoinsChange(e.target.value)}
+                className="w-16 text-center bg-surface-card border border-border-subtle rounded-lg py-1 px-1.5 font-mono font-bold text-xs focus:border-brand-500 focus:outline-none"
+                title="Enter total amount of coins"
+              />
+            </div>
+            <span className="font-mono text-right w-20 text-[11px] font-bold text-text-secondary">
+              {formatMoney(Math.round((Number(counts.coins) || 0) * 100))}
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -134,11 +221,17 @@ function DenominationCounter({
 export default function CashBoxView() {
   const [activeTab, setActiveTab] = useState<'active' | 'closing' | 'history'>('active');
   const [selectedShiftId, setSelectedShiftId] = useState<number | null>(null);
+  const [showMethodsManager, setShowMethodsManager] = useState(false);
+  const [newMethodName, setNewMethodName] = useState('');
+  const [newMethodType, setNewMethodType] = useState<'UPI' | 'CARD' | 'OTHER'>('UPI');
 
   const {
     currentSession,
     isLoadingSession,
     dashboard,
+    lastClosedSummary,
+    paymentMethods,
+    savePaymentMethod,
     transactions,
     expenseCategories,
     openSession,
@@ -156,6 +249,8 @@ export default function CashBoxView() {
 
   // Opening Float Count state
   const [openingCounts, setOpeningCounts] = useState<Counts>(emptyCounts());
+  const [openingVarianceReason, setOpeningVarianceReason] = useState('');
+  const [openingError, setOpeningError] = useState<string | null>(null);
 
   // Cash Movement Form state
   const [movementType, setMovementType] = useState<ShiftMovementType>('cash_in');
@@ -173,6 +268,7 @@ export default function CashBoxView() {
 
   // Closing Shift Flow state
   const [closingCounts, setClosingCounts] = useState<Counts>(emptyCounts());
+  const [nonCashCountedInputs, setNonCashCountedInputs] = useState<Record<string, string>>({});
   const [declaredDifferenceReason, setDeclaredDifferenceReason] = useState('');
   const [closingNotes, setClosingNotes] = useState('');
   const [showTransactionDrawer, setShowTransactionDrawer] = useState(false);
@@ -197,18 +293,83 @@ export default function CashBoxView() {
     expectedCashPaise: currentSession?.opening_cash_paise || 0,
   };
 
+  const prevSessionId = lastClosedSummary?.previousSessionId ?? currentSession?.previous_session_id ?? null;
+  const prevClosingCashPaise = lastClosedSummary?.previousClosingCashPaise ?? currentSession?.previous_closing_cash_paise ?? 0;
+  const prevClosedAt = lastClosedSummary?.previousClosedAt ?? currentSession?.previous_closed_at ?? null;
+
+  const countedOpeningPaise = totalPaise(openingCounts);
+  const openingDiffFromPrevPaise = prevSessionId !== null ? countedOpeningPaise - prevClosingCashPaise : 0;
+  const isOpeningMatchedWithYesterday = prevSessionId === null || openingDiffFromPrevPaise === 0;
+
+  const activeShiftOpeningDiffPaise =
+    currentSession && prevSessionId !== null
+      ? (currentSession.opening_cash_paise || 0) - prevClosingCashPaise
+      : 0;
+
+  const isStaleShift = Boolean(
+    currentSession &&
+      (currentSession.is_stale_previous_day || dashboard?.isStaleShift || isTimestampFromPreviousDay(currentSession.opened_at))
+  );
+
   const countedPhysicalPaise = totalPaise(closingCounts);
   const differencePaise = countedPhysicalPaise - calc.expectedCashPaise;
-  const isClosingMatched = differencePaise === 0;
+
+  // Build per-method Expected vs Counted rows
+  const enabledMethods = (paymentMethods || []).filter((m: any) => m.is_enabled !== 0);
+  const expectedByMethodList: Array<{
+    methodKey: string;
+    displayName: string;
+    methodType: string;
+    expectedPaise: number;
+    txCount: number;
+  }> = dashboard?.nonCashSummary?.expectedByMethod || enabledMethods.map((m: any) => ({
+    methodKey: m.method_key,
+    displayName: m.display_name,
+    methodType: m.method_type,
+    expectedPaise: m.method_key === 'cash' ? calc.expectedCashPaise : 0,
+    txCount: 0,
+  }));
+
+  const methodRows = expectedByMethodList.map(m => {
+    const isCash = m.methodKey === 'cash';
+    const rawStr = nonCashCountedInputs[m.methodKey];
+    const countedPaise = isCash
+      ? countedPhysicalPaise
+      : rawStr !== undefined && rawStr.trim() !== ''
+      ? Math.max(0, Math.round((parseFloat(rawStr) || 0) * 100))
+      : 0;
+    const diff = countedPaise - m.expectedPaise;
+    return {
+      ...m,
+      countedPaise,
+      differencePaise: diff,
+      isMatched: diff === 0,
+    };
+  });
+
+  const isAllMethodsMatched = methodRows.every(r => r.isMatched);
+  const isClosingMatched = differencePaise === 0 && isAllMethodsMatched;
 
   // Handle Opening a Shift
   const handleOpenShift = async () => {
+    setOpeningError(null);
     const openingPaise = totalPaise(openingCounts);
+    if (!isOpeningMatchedWithYesterday && !openingVarianceReason.trim()) {
+      setOpeningError(
+        `Opening cash (${formatMoney(openingPaise)}) differs from yesterday's closing cash (${formatMoney(prevClosingCashPaise)}). Please enter a reason.`
+      );
+      return;
+    }
     try {
-      await openSession({ openingCashPaise: openingPaise, denominations: openingCounts });
+      await openSession({
+        openingCashPaise: openingPaise,
+        denominations: openingCounts,
+        openingVarianceReason: openingVarianceReason.trim() || undefined,
+      });
       setOpeningCounts(emptyCounts());
+      setOpeningVarianceReason('');
     } catch (err: any) {
-      alert(err?.message || 'Failed to open shift');
+      setOpeningError(err?.message || 'Failed to open shift');
     }
   };
 
@@ -256,8 +417,13 @@ export default function CashBoxView() {
     setClosingError(null);
 
     if (!isClosingMatched && !declaredDifferenceReason.trim()) {
-      setClosingError('Declared reason is mandatory when physical cash differs from expected cash');
+      setClosingError('Declared reason is mandatory when counted cash or payment method totals differ from expected');
       return;
+    }
+
+    const countedByMethodPayload: Record<string, number> = {};
+    for (const r of methodRows) {
+      countedByMethodPayload[r.methodKey] = r.countedPaise;
     }
 
     try {
@@ -265,10 +431,12 @@ export default function CashBoxView() {
         sessionId: currentSession.id,
         closingCashPaise: countedPhysicalPaise,
         denominations: closingCounts,
+        countedByMethod: countedByMethodPayload,
         declaredReason: declaredDifferenceReason.trim() || undefined,
         notes: closingNotes.trim() || undefined,
       });
       setClosingCounts(emptyCounts());
+      setNonCashCountedInputs({});
       setDeclaredDifferenceReason('');
       setClosingNotes('');
       setActiveTab('history');
@@ -287,52 +455,90 @@ export default function CashBoxView() {
             <span>Cash Box & Shift Reconciliation</span>
           </h1>
           <p className="text-xs text-text-muted mt-0.5">
-            Strict audit-trail cash flow, multi-category movements, step-by-step closing & correctable history.
+            Strict audit-trail cash flow, multi-method closing (Cash, Paytm, GPay, PhonePe, Card, Other) & yesterday closing tally.
           </p>
         </div>
 
-        <div className="flex items-center gap-2 bg-surface-card p-1 rounded-2xl border border-border-subtle">
+        <div className="flex items-center gap-2">
           <button
-            onClick={() => setActiveTab('active')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
-              activeTab === 'active'
-                ? 'bg-brand-500 text-white shadow-sm'
-                : 'text-text-secondary hover:text-text-primary'
-            }`}
+            onClick={() => setShowMethodsManager(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-surface-card border border-border-subtle text-text-secondary hover:text-text-primary transition-all"
+            title="Manage Payment Methods (Add / Rename / Disable)"
           >
-            <Unlock size={14} />
-            <span>Active Shift</span>
-            {currentSession && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1" />}
+            <Settings size={14} />
+            <span>Payment Methods</span>
           </button>
 
-          <button
-            onClick={() => setActiveTab('closing')}
-            disabled={!currentSession}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
-              activeTab === 'closing'
-                ? 'bg-brand-500 text-white shadow-sm'
-                : !currentSession
-                ? 'text-text-muted/40 cursor-not-allowed'
-                : 'text-text-secondary hover:text-text-primary'
-            }`}
-          >
-            <ShieldCheck size={14} />
-            <span>Close Shift</span>
-          </button>
+          <div className="flex items-center gap-2 bg-surface-card p-1 rounded-2xl border border-border-subtle">
+            <button
+              onClick={() => setActiveTab('active')}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                activeTab === 'active'
+                  ? 'bg-brand-500 text-white shadow-sm'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              <Unlock size={14} />
+              <span>Active Shift</span>
+              {currentSession && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse ml-1" />}
+            </button>
 
-          <button
-            onClick={() => setActiveTab('history')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
-              activeTab === 'history'
-                ? 'bg-brand-500 text-white shadow-sm'
-                : 'text-text-secondary hover:text-text-primary'
-            }`}
-          >
-            <History size={14} />
-            <span>Shift History</span>
-          </button>
+            <button
+              onClick={() => setActiveTab('closing')}
+              disabled={!currentSession}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                activeTab === 'closing'
+                  ? 'bg-brand-500 text-white shadow-sm'
+                  : !currentSession
+                  ? 'text-text-muted/40 cursor-not-allowed'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              <ShieldCheck size={14} />
+              <span>Close Shift</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('history')}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                activeTab === 'history'
+                  ? 'bg-brand-500 text-white shadow-sm'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              <History size={14} />
+              <span>Shift History</span>
+            </button>
+          </div>
         </div>
       </header>
+
+      {/* ─── Stale Previous-Day Shift Warning Banner (Item 11d) ──────────────── */}
+      {isStaleShift && currentSession && (
+        <div className="mx-4 sm:mx-6 mt-4 p-4 rounded-2xl bg-amber-500/15 border-2 border-amber-500/40 flex flex-wrap items-center justify-between gap-3 shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+              <AlertTriangle size={22} />
+            </div>
+            <div>
+              <div className="text-sm font-black text-amber-300">
+                Stale Shift Detected from a Previous Day (Shift #{currentSession.id})
+              </div>
+              <p className="text-xs text-text-secondary mt-0.5">
+                Opened on <span className="font-mono font-bold text-text-primary">{formatShiftDateTime(currentSession.opened_at)}</span> (Current System Time: <span className="font-mono font-bold text-text-primary">{new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}</span>). Please close this previous shift before starting today's billing.
+              </p>
+            </div>
+          </div>
+          {activeTab !== 'closing' && (
+            <button
+              onClick={() => setActiveTab('closing')}
+              className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs transition-all shadow-md"
+            >
+              Close Stale Shift #{currentSession.id} Now →
+            </button>
+          )}
+        </div>
+      )}
 
       {/* ─── Main Content Body ──────────────────────────────────────────────── */}
       <main className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
@@ -344,17 +550,54 @@ export default function CashBoxView() {
             {isLoadingSession ? (
               <div className="p-12 text-center text-text-muted text-xs">Loading active shift status...</div>
             ) : !currentSession ? (
-              /* No Active Shift -> Prompt to Open */
-              <div className="max-w-xl mx-auto space-y-5 bg-surface-panel border border-border-subtle rounded-3xl p-6 shadow-sm">
+              /* No Active Shift -> Prompt to Open with Yesterday's Closing Cash Tally (Item 11c) */
+              <div className="max-w-2xl mx-auto space-y-5 bg-surface-panel border border-border-subtle rounded-3xl p-6 shadow-sm">
                 <div className="text-center space-y-1">
                   <div className="w-12 h-12 rounded-2xl bg-brand-500/10 text-brand-500 flex items-center justify-center mx-auto mb-3 border border-brand-500/20">
                     <Unlock size={24} />
                   </div>
-                  <h2 className="text-lg font-black">Open Shift & Count Opening Float</h2>
+                  <h2 className="text-lg font-black">Open Shift & Tally with Previous Closing Cash</h2>
                   <p className="text-xs text-text-muted">
-                    Count the physical cash in the drawer to establish this shift's opening balance float.
+                    Count the physical cash in the drawer. Opening cash must tally with yesterday's closing cash.
                   </p>
                 </div>
+
+                {/* Previous Shift Closing Cash Tally Banner */}
+                {prevSessionId !== null && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 rounded-2xl bg-surface-card border border-border-subtle text-center">
+                    <div>
+                      <span className="text-[10px] font-bold uppercase text-text-muted">
+                        Yesterday / Prev Shift #{prevSessionId} Closing
+                      </span>
+                      <div className="text-base font-black font-mono text-text-primary mt-0.5">
+                        {formatMoney(prevClosingCashPaise)}
+                      </div>
+                      {prevClosedAt && (
+                        <div className="text-[10px] text-text-muted">{formatShiftDateTime(prevClosedAt)}</div>
+                      )}
+                    </div>
+
+                    <div>
+                      <span className="text-[10px] font-bold uppercase text-text-muted">Counted Opening Cash</span>
+                      <div className="text-base font-black font-mono text-brand-400 mt-0.5">
+                        {formatMoney(countedOpeningPaise)}
+                      </div>
+                    </div>
+
+                    <div className={`rounded-xl p-2 border ${
+                      isOpeningMatchedWithYesterday
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                        : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+                    }`}>
+                      <span className="text-[10px] font-bold uppercase">Difference</span>
+                      <div className="text-base font-black font-mono mt-0.5">
+                        {isOpeningMatchedWithYesterday
+                          ? '₹0.00 (Matched)'
+                          : `${openingDiffFromPrevPaise > 0 ? '+' : '−'}${formatMoney(Math.abs(openingDiffFromPrevPaise))}`}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 <DenominationCounter 
                   counts={openingCounts} 
@@ -362,13 +605,35 @@ export default function CashBoxView() {
                   title="Opening Float Physical Denominations" 
                 />
 
+                {!isOpeningMatchedWithYesterday && (
+                  <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-2">
+                    <div className="flex items-center gap-2 text-rose-400 font-bold text-xs">
+                      <AlertTriangle size={15} />
+                      <span>Opening Cash Does Not Match Previous Closing Cash ({formatMoney(prevClosingCashPaise)})</span>
+                    </div>
+                    <input
+                      type="text"
+                      value={openingVarianceReason}
+                      onChange={e => setOpeningVarianceReason(e.target.value)}
+                      placeholder="Mandatory reason required (e.g. Owner withdrew ₹2,000 overnight / Float added)..."
+                      className="w-full bg-surface-card border border-rose-500/40 rounded-xl p-2.5 text-xs focus:border-rose-400 focus:outline-none"
+                    />
+                  </div>
+                )}
+
+                {openingError && (
+                  <p className="text-xs text-rose-400 font-bold bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
+                    {openingError}
+                  </p>
+                )}
+
                 <button
                   onClick={handleOpenShift}
                   disabled={isOpeningSession}
                   className="w-full btn-primary py-3 rounded-2xl text-sm font-black flex items-center justify-center gap-2 shadow-lg shadow-brand-500/20"
                 >
                   <Unlock size={16} />
-                  <span>{isOpeningSession ? 'Opening Shift...' : `Open Shift with ${formatMoney(totalPaise(openingCounts))}`}</span>
+                  <span>{isOpeningSession ? 'Opening Shift...' : `Open Shift with ${formatMoney(countedOpeningPaise)}`}</span>
                 </button>
               </div>
             ) : (
@@ -381,15 +646,26 @@ export default function CashBoxView() {
                       #{currentSession.id}
                     </div>
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-black">Active Shift #{currentSession.id}</span>
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/20">
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                           <span>Open</span>
                         </span>
+                        {prevSessionId !== null && (
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                            activeShiftOpeningDiffPaise === 0
+                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          }`}>
+                            {activeShiftOpeningDiffPaise === 0
+                              ? `✓ Opening matches Prev Shift #${prevSessionId} (${formatMoney(prevClosingCashPaise)})`
+                              : `⚠️ Opening diff vs Prev Shift #${prevSessionId}: ${activeShiftOpeningDiffPaise > 0 ? '+' : '−'}${formatMoney(Math.abs(activeShiftOpeningDiffPaise))}`}
+                          </span>
+                        )}
                       </div>
                       <p className="text-[11px] text-text-muted mt-0.5">
-                        Opened at: {new Date(currentSession.opened_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • Cashier #{currentSession.cashier_id}
+                        Opened: <span className="font-mono font-bold text-text-secondary">{formatShiftDateTime(currentSession.opened_at)}</span> • Cashier #{currentSession.cashier_id}
                       </p>
                     </div>
                   </div>
@@ -424,7 +700,7 @@ export default function CashBoxView() {
                     <div className="text-lg font-black font-mono text-brand-300 mt-1">
                       {formatMoney(calc.expectedCashPaise)}
                     </div>
-                    <span className="text-[9px] text-text-muted mt-1">Formula-derived</span>
+                    <span className="text-[9px] text-text-muted mt-1">Real completed sales only</span>
                   </div>
 
                   <div className="p-3 rounded-2xl bg-surface-panel border border-border-subtle">
@@ -638,7 +914,7 @@ export default function CashBoxView() {
                             {(dashboard?.recentMovements || []).map((m: ShiftCashMovement) => (
                               <tr key={m.id} className="hover:bg-surface-hover/30 transition-colors">
                                 <td className="p-2.5 font-mono text-text-muted text-[11px]">
-                                  {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  {formatShiftTime(m.created_at)}
                                 </td>
                                 <td className="p-2.5">
                                   <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
@@ -700,21 +976,31 @@ export default function CashBoxView() {
         )}
 
         {/* ═════════════════════════════════════════════════════════════════════ */}
-        {/* TAB 2: STEP-BY-STEP SHIFT CLOSING FLOW */}
+        {/* TAB 2: STEP-BY-STEP SHIFT CLOSING FLOW (Item 11a, 11b, 11c) */}
         {/* ═════════════════════════════════════════════════════════════════════ */}
         {activeTab === 'closing' && currentSession && (
-          <div className="max-w-4xl mx-auto space-y-6">
-            <div className="border-b border-border-subtle pb-3">
-              <h2 className="text-lg font-black flex items-center gap-2">
-                <Lock className="text-brand-500" size={20} />
-                <span>Shift Closing & Physical Reconciliation — Shift #{currentSession.id}</span>
-              </h2>
-              <p className="text-xs text-text-muted mt-0.5">
-                Verify the live calculation breakdown, count physical cash denominations, and resolve any difference before locking.
-              </p>
+          <div className="max-w-5xl mx-auto space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border-subtle pb-3">
+              <div>
+                <h2 className="text-lg font-black flex items-center gap-2">
+                  <Lock className="text-brand-500" size={20} />
+                  <span>Shift Closing & Multi-Method Reconciliation — Shift #{currentSession.id}</span>
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Count physical cash denominations and enter counted totals for Paytm, Google Pay, PhonePe, Card, and Other methods.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMethodsManager(true)}
+                className="px-3 py-1.5 rounded-xl bg-surface-panel border border-border-subtle text-xs font-bold text-text-secondary hover:text-text-primary flex items-center gap-1.5"
+              >
+                <Settings size={14} />
+                <span>Configure Payment Methods</span>
+              </button>
             </div>
 
-            {/* Step 1: Expected Cash Calculation & Non-Cash Panels */}
+            {/* Step 1: Opening Cash Tally vs Yesterday's Closing + Expected Cash Formula */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {/* Expected Cash Formula Panel */}
               <div className="bg-surface-panel border border-border-subtle rounded-3xl p-5 shadow-sm space-y-3">
@@ -728,7 +1014,7 @@ export default function CashBoxView() {
                     <span className="font-mono font-bold">{formatMoney(calc.openingCashPaise)}</span>
                   </div>
                   <div className="flex justify-between pt-1.5 text-emerald-400">
-                    <span>+ Cash Sales:</span>
+                    <span>+ Cash Sales (Completed Bills):</span>
                     <span className="font-mono font-bold">+{formatMoney(calc.cashSalesPaise)}</span>
                   </div>
                   <div className="flex justify-between pt-1.5 text-cyan-400">
@@ -754,69 +1040,123 @@ export default function CashBoxView() {
                 </div>
               </div>
 
-              {/* Non-Cash Summary Panel */}
-              <div className="bg-surface-panel border border-border-subtle rounded-3xl p-5 shadow-sm space-y-3">
-                <span className="text-[10px] font-black uppercase text-cyan-400 tracking-wider">
-                  Non-Cash Shift Payments (Tracked Separately)
-                </span>
+              {/* Yesterday's Closing Cash Tally & Shift Info Panel */}
+              <div className="bg-surface-panel border border-border-subtle rounded-3xl p-5 shadow-sm space-y-3 flex flex-col justify-between">
+                <div className="space-y-3">
+                  <span className="text-[10px] font-black uppercase text-cyan-400 tracking-wider">
+                    Opening Cash vs Yesterday's Closing Tally
+                  </span>
 
-                <div className="space-y-2.5 text-xs">
-                  <div className="p-2.5 rounded-2xl bg-surface-card border border-border-subtle flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Smartphone size={16} className="text-emerald-400" />
-                      <div>
-                        <div className="font-bold">UPI / QR Code</div>
-                        <div className="text-[10px] text-text-muted">{dashboard?.nonCashSummary?.upiCount || 0} Transactions</div>
-                      </div>
+                  <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                    <div className="p-2.5 rounded-2xl bg-surface-card border border-border-subtle">
+                      <div className="text-[10px] text-text-muted uppercase font-bold">Prev Closing</div>
+                      <div className="font-mono font-black text-sm mt-0.5">{formatMoney(prevClosingCashPaise)}</div>
+                      {prevSessionId && <div className="text-[9px] text-text-muted">Shift #{prevSessionId}</div>}
                     </div>
-                    <span className="font-mono font-bold text-emerald-400">
-                      {formatMoney(dashboard?.nonCashSummary?.upiSalesPaise || 0)}
-                    </span>
+                    <div className="p-2.5 rounded-2xl bg-surface-card border border-border-subtle">
+                      <div className="text-[10px] text-text-muted uppercase font-bold">This Opening</div>
+                      <div className="font-mono font-black text-sm mt-0.5">{formatMoney(calc.openingCashPaise)}</div>
+                      <div className="text-[9px] text-text-muted">Shift #{currentSession.id}</div>
+                    </div>
+                    <div className={`p-2.5 rounded-2xl border ${
+                      activeShiftOpeningDiffPaise === 0
+                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                        : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+                    }`}>
+                      <div className="text-[10px] uppercase font-bold">Tally Diff</div>
+                      <div className="font-mono font-black text-sm mt-0.5">
+                        {activeShiftOpeningDiffPaise === 0
+                          ? '₹0.00'
+                          : `${activeShiftOpeningDiffPaise > 0 ? '+' : '−'}${formatMoney(Math.abs(activeShiftOpeningDiffPaise))}`}
+                      </div>
+                      <div className="text-[9px] font-bold">{activeShiftOpeningDiffPaise === 0 ? 'Matched' : 'Variance'}</div>
+                    </div>
                   </div>
+                </div>
 
-                  <div className="p-2.5 rounded-2xl bg-surface-card border border-border-subtle flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <CreditCard size={16} className="text-blue-400" />
-                      <div>
-                        <div className="font-bold">Card / POS Swipe</div>
-                        <div className="text-[10px] text-text-muted">{dashboard?.nonCashSummary?.cardCount || 0} Transactions</div>
-                      </div>
-                    </div>
-                    <span className="font-mono font-bold text-blue-400">
-                      {formatMoney(dashboard?.nonCashSummary?.cardSalesPaise || 0)}
-                    </span>
+                <div className="p-3 rounded-2xl bg-surface-card border border-border-subtle text-xs flex items-center justify-between">
+                  <div>
+                    <div className="font-bold text-text-primary">Credit / Udhaar Sales (Tracked in A/R)</div>
+                    <div className="text-[10px] text-text-muted">{dashboard?.nonCashSummary?.creditCount || 0} Credit Invoices in Shift</div>
                   </div>
-
-                  <div className="p-2.5 rounded-2xl bg-surface-card border border-border-subtle flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <FileText size={16} className="text-purple-400" />
-                      <div>
-                        <div className="font-bold">Credit / Customer AR</div>
-                        <div className="text-[10px] text-text-muted">{dashboard?.nonCashSummary?.creditCount || 0} Transactions</div>
-                      </div>
-                    </div>
-                    <span className="font-mono font-bold text-purple-400">
-                      {formatMoney(dashboard?.nonCashSummary?.creditSalesPaise || 0)}
-                    </span>
-                  </div>
+                  <span className="font-mono font-black text-purple-400">
+                    {formatMoney(dashboard?.nonCashSummary?.creditSalesPaise || 0)}
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Step 2: Physical Count Denomination Table */}
-            <div className="space-y-2">
-              <span className="text-xs font-black uppercase text-text-muted">2. Count Physical Cash in Drawer</span>
-              <DenominationCounter 
-                counts={closingCounts} 
-                setCounts={setClosingCounts} 
-                title="Closing Physical Cash Count" 
-              />
+            {/* Step 2: Physical Cash Denominations + Manual Entry for Paytm, GPay, PhonePe, Card, Other */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              <div className="lg:col-span-7 space-y-2">
+                <span className="text-xs font-black uppercase text-text-muted">
+                  2A. Count Physical Cash in Drawer (Denominations)
+                </span>
+                <DenominationCounter 
+                  counts={closingCounts} 
+                  setCounts={setClosingCounts} 
+                  title="Closing Physical Cash Count" 
+                />
+              </div>
+
+              <div className="lg:col-span-5 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black uppercase text-text-muted">
+                    2B. Enter Non-Cash Method Totals
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const prefilled: Record<string, string> = {};
+                      for (const m of methodRows) {
+                        if (m.methodKey !== 'cash') {
+                          prefilled[m.methodKey] = (m.expectedPaise / 100).toFixed(2);
+                        }
+                      }
+                      setNonCashCountedInputs(prefilled);
+                    }}
+                    className="text-[11px] font-bold text-brand-400 hover:underline"
+                  >
+                    Fill Expected for Non-Cash
+                  </button>
+                </div>
+
+                <div className="bg-surface-card border border-border-subtle rounded-2xl p-4 shadow-sm space-y-3">
+                  {methodRows.filter(m => m.methodKey !== 'cash').map(m => (
+                    <div key={m.methodKey} className="p-2.5 rounded-xl bg-surface-panel/70 border border-border-subtle/50 flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold text-text-primary flex items-center gap-1.5">
+                          {m.methodType === 'CARD' ? <CreditCard size={13} className="text-blue-400" /> : <Smartphone size={13} className="text-emerald-400" />}
+                          <span>{m.displayName}</span>
+                        </div>
+                        <div className="text-[10px] text-text-muted font-mono">
+                          Expected: {formatMoney(m.expectedPaise)} ({m.txCount} txns)
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-bold text-text-muted">₹</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={nonCashCountedInputs[m.methodKey] ?? ''}
+                          placeholder="0.00"
+                          onChange={e => setNonCashCountedInputs({ ...nonCashCountedInputs, [m.methodKey]: e.target.value })}
+                          className="w-28 text-right bg-surface-card border border-border-subtle rounded-xl py-1.5 px-2.5 font-mono font-bold text-xs focus:border-brand-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
 
-            {/* Step 3: Comparison & Match Status */}
+            {/* Step 3: Expected vs Counted Per Method & Difference (Red/Green) */}
             <div className="p-5 rounded-3xl bg-surface-panel border border-border-subtle shadow-sm space-y-4">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-black uppercase text-text-muted">3. Reconciliation Comparison</span>
+                <span className="text-xs font-black uppercase text-text-muted">
+                  3. Expected vs Counted Per Payment Method
+                </span>
                 <button
                   type="button"
                   onClick={() => setShowTransactionDrawer(!showTransactionDrawer)}
@@ -827,29 +1167,50 @@ export default function CashBoxView() {
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-center">
-                <div className="p-3 rounded-2xl bg-surface-card border border-border-subtle">
-                  <span className="text-[10px] uppercase font-bold text-text-muted">Expected Cash</span>
-                  <div className="text-base font-black font-mono mt-0.5">{formatMoney(calc.expectedCashPaise)}</div>
-                </div>
-
-                <div className="p-3 rounded-2xl bg-surface-card border border-border-subtle">
-                  <span className="text-[10px] uppercase font-bold text-text-muted">Physical Count</span>
-                  <div className="text-base font-black font-mono mt-0.5 text-brand-400">{formatMoney(countedPhysicalPaise)}</div>
-                </div>
-
-                <div className={`p-3 rounded-2xl border ${
-                  isClosingMatched 
-                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' 
-                    : differencePaise < 0 
-                    ? 'bg-rose-500/10 border-rose-500/30 text-rose-400' 
-                    : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                }`}>
-                  <span className="text-[10px] uppercase font-bold">Difference</span>
-                  <div className="text-base font-black font-mono mt-0.5">
-                    {isClosingMatched ? '₹0.00 (Matched)' : `${differencePaise < 0 ? 'SHORT' : 'OVER'} ${formatMoney(Math.abs(differencePaise))}`}
-                  </div>
-                </div>
+              <div className="overflow-x-auto border border-border-subtle rounded-2xl">
+                <table className="w-full text-xs text-left">
+                  <thead className="bg-surface-card text-text-muted uppercase text-[10px] font-bold border-b border-border-subtle">
+                    <tr>
+                      <th className="py-2.5 px-4">Payment Method</th>
+                      <th className="py-2.5 px-4 text-right">Expected</th>
+                      <th className="py-2.5 px-4 text-right">Counted / Entered</th>
+                      <th className="py-2.5 px-4 text-right">Difference</th>
+                      <th className="py-2.5 px-4 text-center">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border-subtle/50">
+                    {methodRows.map(row => (
+                      <tr key={row.methodKey} className="hover:bg-surface-hover/20">
+                        <td className="py-3 px-4 font-bold text-text-primary">
+                          {row.displayName}
+                          <span className="ml-2 text-[10px] font-mono text-text-muted uppercase">({row.methodType})</span>
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-bold">
+                          {formatMoney(row.expectedPaise)}
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-bold text-brand-400">
+                          {formatMoney(row.countedPaise)}
+                        </td>
+                        <td className={`py-3 px-4 text-right font-mono font-black ${
+                          row.isMatched ? 'text-emerald-400' : 'text-rose-400'
+                        }`}>
+                          {row.isMatched
+                            ? '₹0.00'
+                            : `${row.differencePaise > 0 ? '+' : '−'}${formatMoney(Math.abs(row.differencePaise))}`}
+                        </td>
+                        <td className="py-3 px-4 text-center">
+                          <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${
+                            row.isMatched
+                              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                              : 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+                          }`}>
+                            {row.isMatched ? '✓ Matched' : row.differencePaise < 0 ? 'SHORT' : 'OVER'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
 
               {/* Transaction Inspection Drawer */}
@@ -874,7 +1235,7 @@ export default function CashBoxView() {
                       <tbody className="divide-y divide-border-subtle/40">
                         {transactions.map((tx: any) => (
                           <tr key={tx.id} className="text-[11px]">
-                            <td className="p-1.5 font-mono text-text-muted">{new Date(tx.created_at).toLocaleTimeString()}</td>
+                            <td className="p-1.5 font-mono text-text-muted">{formatShiftTime(tx.created_at)}</td>
                             <td className="p-1.5 font-bold">{tx.type}</td>
                             <td className="p-1.5 text-text-secondary truncate max-w-[200px]">{tx.reference_id || tx.reason}</td>
                             <td className="p-1.5 text-right font-mono text-emerald-400">{tx.cash_in_paise ? formatMoney(tx.cash_in_paise) : '—'}</td>
@@ -889,20 +1250,20 @@ export default function CashBoxView() {
 
               {/* If Mismatched: Required Declared Difference Reason */}
               {!isClosingMatched && (
-                <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 space-y-2">
-                  <div className="flex items-center gap-2 text-amber-400 font-bold text-xs">
+                <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-2">
+                  <div className="flex items-center gap-2 text-rose-400 font-bold text-xs">
                     <AlertTriangle size={16} />
                     <span>Difference Detected: Mandatory Declared Reason Required</span>
                   </div>
                   <p className="text-[11px] text-text-muted">
-                    Silent closing is blocked. You must state the operational cause of the difference for audit & manager review.
+                    Silent closing is blocked when any payment method has a difference. State the operational cause for audit & manager review.
                   </p>
                   <input
                     type="text"
                     value={declaredDifferenceReason}
                     onChange={e => setDeclaredDifferenceReason(e.target.value)}
-                    placeholder="e.g. Customer paid via UPI but cashier entered as Cash / Excess change given"
-                    className="w-full bg-surface-card border border-amber-500/40 rounded-xl p-2.5 text-xs focus:border-amber-400 focus:outline-none"
+                    placeholder="e.g. Customer paid via PhonePe instead of Google Pay / Excess change given"
+                    className="w-full bg-surface-card border border-rose-500/40 rounded-xl p-2.5 text-xs focus:border-rose-400 focus:outline-none"
                   />
                 </div>
               )}
@@ -934,7 +1295,7 @@ export default function CashBoxView() {
                   {isClosingSession
                     ? 'Finalizing Shift...'
                     : isClosingMatched
-                    ? 'Confirm Count & Close Shift (Matched)'
+                    ? 'Confirm Count & Close Shift (All Methods Matched)'
                     : 'Confirm Count & Close Shift with Declared Reason'}
                 </span>
               </button>
@@ -1041,10 +1402,9 @@ export default function CashBoxView() {
                             </td>
 
                             <td className="py-3.5 px-4 text-[11px] text-text-muted font-mono">
-                              <div>{new Date(shift.opened_at).toLocaleDateString()}</div>
+                              <div>{formatShiftDateTime(shift.opened_at)}</div>
                               <div className="text-[10px]">
-                                {new Date(shift.opened_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                {shift.closed_at ? ` - ${new Date(shift.closed_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ' (Active)'}
+                                {shift.closed_at ? `Closed: ${formatShiftTime(shift.closed_at)}` : '🟢 Active'}
                               </div>
                             </td>
 
@@ -1116,6 +1476,117 @@ export default function CashBoxView() {
           </div>
         )}
       </main>
+
+      {/* ─── MODAL 0: PAYMENT METHODS MANAGER (Add / Rename / Enable-Disable) ─── */}
+      {showMethodsManager && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-surface-panel border border-border-subtle rounded-3xl p-5 max-w-lg w-full shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-border-subtle pb-2.5">
+              <div>
+                <h3 className="text-sm font-black flex items-center gap-2">
+                  <Settings size={16} className="text-brand-500" />
+                  <span>Manage Payment Methods</span>
+                </h3>
+                <p className="text-[11px] text-text-muted">
+                  Add, rename, or enable/disable payment methods shown during Shift Closing & Settings.
+                </p>
+              </div>
+              <button onClick={() => setShowMethodsManager(false)} className="text-text-muted hover:text-text-primary">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              {(paymentMethods || []).map((m: any) => (
+                <div key={m.id || m.method_key} className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-surface-card border border-border-subtle text-xs">
+                  <div className="flex items-center gap-2 flex-1">
+                    <input
+                      type="text"
+                      defaultValue={m.display_name}
+                      disabled={m.method_key === 'cash'}
+                      onBlur={async e => {
+                        const val = e.target.value.trim();
+                        if (val && val !== m.display_name) {
+                          await savePaymentMethod({
+                            id: m.id,
+                            method_key: m.method_key,
+                            display_name: val,
+                            method_type: m.method_type,
+                            is_enabled: m.is_enabled,
+                          });
+                        }
+                      }}
+                      className="bg-surface-panel border border-border-subtle rounded-lg px-2.5 py-1 text-xs font-bold flex-1"
+                    />
+                    <span className="text-[10px] font-mono uppercase text-text-muted px-2 py-0.5 rounded bg-surface-panel">
+                      {m.method_type}
+                    </span>
+                  </div>
+                  {m.method_key !== 'cash' && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await savePaymentMethod({
+                          id: m.id,
+                          method_key: m.method_key,
+                          display_name: m.display_name,
+                          method_type: m.method_type,
+                          is_enabled: m.is_enabled ? 0 : 1,
+                        });
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border ${
+                        m.is_enabled
+                          ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                          : 'bg-surface-panel text-text-muted border-border-subtle'
+                      }`}
+                    >
+                      {m.is_enabled ? 'Enabled' : 'Disabled'}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="pt-2 border-t border-border-subtle space-y-2">
+              <span className="text-[10px] font-bold uppercase text-text-muted">Add New Payment Method</span>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newMethodName}
+                  onChange={e => setNewMethodName(e.target.value)}
+                  placeholder="e.g. Amazon Pay / BharatPe"
+                  className="flex-1 bg-surface-card border border-border-subtle rounded-xl p-2 text-xs"
+                />
+                <select
+                  value={newMethodType}
+                  onChange={e => setNewMethodType(e.target.value as any)}
+                  className="bg-surface-card border border-border-subtle rounded-xl p-2 text-xs font-bold"
+                >
+                  <option value="UPI">UPI</option>
+                  <option value="CARD">CARD</option>
+                  <option value="OTHER">OTHER</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!newMethodName.trim()) return;
+                    await savePaymentMethod({
+                      display_name: newMethodName.trim(),
+                      method_type: newMethodType,
+                      is_enabled: 1,
+                    });
+                    setNewMethodName('');
+                  }}
+                  className="btn-primary px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1"
+                >
+                  <Plus size={14} />
+                  <span>Add</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ─── MODAL 1: EDIT OPEN MOVEMENT ──────────────────────────────────────── */}
       {editingMovement && (

@@ -55,6 +55,8 @@ export const CreateCustomerSchema = z.object({
   packaging_preference: optionalField(z.string().max(100)),
   special_instructions: optionalField(z.string().max(1000)),
   notes: optionalField(z.string().max(1000)),
+  is_test: z.union([z.boolean(), z.number()]).transform(val => Boolean(val)).optional(),
+  is_system: z.union([z.boolean(), z.number()]).transform(val => Boolean(val)).optional(),
 });
 
 export type CreateCustomerInput = z.infer<typeof CreateCustomerSchema>;

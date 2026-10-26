@@ -99,7 +99,8 @@ export const POSWindowMockupPreview: React.FC = () => {
           Accent: <span style={{ color: activeColor.hex }}>{activeColor.name}</span>
         </p>
         <p className="text-[10px] text-text-muted">
-          Theme Mode: <strong className="text-text-secondary uppercase">{draftAppearance.mode}</strong> ·
+          Design: <strong className="text-text-secondary uppercase">{draftAppearance.billingStyle === 'express' ? 'Express Counter' : 'Standard POS'}</strong> ·
+          Theme: <strong className="text-text-secondary uppercase">{draftAppearance.mode}</strong> ·
           Cart: <strong className="text-text-secondary uppercase">{draftAppearance.cartDisplay}</strong>
         </p>
       </div>

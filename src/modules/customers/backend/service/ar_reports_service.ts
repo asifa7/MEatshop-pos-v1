@@ -272,7 +272,10 @@ export class ARReportsService {
              cca.is_frozen, cca.is_blacklisted
       FROM customers c
       LEFT JOIN customer_credit_accounts cca ON c.id = cca.customer_id
-      WHERE c.outstanding_balance_paise > 0 OR c.credit_allowed = 1
+      WHERE (c.outstanding_balance_paise > 0 OR c.credit_allowed = 1)
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
       ORDER BY c.outstanding_balance_paise DESC
     `).all() as any[];
 
@@ -468,6 +471,9 @@ export class ARReportsService {
       FROM customers c 
       LEFT JOIN customer_groups cg ON c.group_id = cg.id 
       WHERE c.outstanding_balance_paise > 0
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
     `;
     const params: any[] = [];
 
@@ -598,6 +604,9 @@ export class ARReportsService {
       FROM customers c 
       LEFT JOIN customer_groups cg ON c.group_id = cg.id 
       WHERE c.advance_balance_paise > 0
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
       ORDER BY c.advance_balance_paise DESC
     `).all();
   }
@@ -609,6 +618,9 @@ export class ARReportsService {
       SELECT c.id, c.customer_code, c.name, c.phone, c.outstanding_balance_paise
       FROM customers c
       WHERE c.outstanding_balance_paise > 0
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
     `).all() as any[];
 
     const result: any[] = [];
@@ -617,6 +629,7 @@ export class ARReportsService {
       const oldest = db.prepare(`
         SELECT completed_at, invoice_number FROM invoices 
         WHERE customer_id = ? AND status = 'completed' AND payment_status IN ('unpaid', 'partial')
+          AND (is_test = 0 OR is_test IS NULL)
         ORDER BY completed_at ASC LIMIT 1
       `).get(cust.id) as { completed_at: string; invoice_number: string } | undefined;
 
@@ -654,6 +667,9 @@ export class ARReportsService {
       FROM customers c 
       LEFT JOIN customer_groups cg ON c.group_id = cg.id 
       WHERE c.outstanding_balance_paise > 0
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
       ORDER BY c.outstanding_balance_paise DESC
       LIMIT ?
     `).all(limit);
@@ -665,6 +681,9 @@ export class ARReportsService {
         (CAST(c.outstanding_balance_paise AS REAL) / c.credit_limit_paise * 100) as utilization_percent
       FROM customers c
       WHERE c.credit_allowed = 1 AND c.credit_limit_paise > 0
+        AND (c.is_test = 0 OR c.is_test IS NULL)
+        AND (c.is_system = 0 OR c.is_system IS NULL)
+        AND (c.status != 'merged' OR c.status IS NULL)
       ORDER BY utilization_percent DESC
     `).all();
   }

@@ -728,3 +728,20 @@ export function usePrintPurchaseThermal() {
     },
   });
 }
+
+export function useLastPurchaseRate(supplierId?: number, variantId?: number) {
+  return useQuery<number | null>({
+    queryKey: ['procurement', 'lastRate', supplierId, variantId],
+    queryFn: async () => {
+      if (!supplierId || !variantId) return null;
+      const res = await window.api.invoke(IPC_CHANNELS.INVENTORY.GET_LAST_PURCHASE_RATE, {
+        supplier_id: supplierId,
+        product_variant_id: variantId,
+      });
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    enabled: !!supplierId && !!variantId,
+    staleTime: 30000,
+  });
+}

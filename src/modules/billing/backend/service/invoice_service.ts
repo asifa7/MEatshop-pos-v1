@@ -6,6 +6,7 @@ import { creditService } from '../../../customers/backend/service/credit_service
 import { cashBoxService } from '../../../cashbox/backend/service/cashbox_service';
 import { fifoService } from '../../../inventory/backend/service/fifo_service';
 import { db } from '../../../../core/backend/db';
+import { roundHalfUp } from '../../../../core/shared/math';
 import {
   CreateInvoiceSchema,
   VoidInvoiceSchema,
@@ -71,12 +72,21 @@ export class InvoiceService {
   }
 
   public getInvoice(invoiceId: number): InvoiceDetail {
-    return this.invoiceRepo.findById(invoiceId);
+    const detail = this.invoiceRepo.findById(invoiceId);
+    if (detail?.invoice && (detail.invoice.status === 'draft' || detail.invoice.status === 'held') && !detail.invoice.invoice_number) {
+      const peek = invoiceNumberingService.peekNextNumber();
+      (detail.invoice as any).next_continuous_number = typeof peek === 'number' ? peek : (peek as any)?.invoiceNumber ?? peek;
+    }
+    return detail;
   }
 
   public getActiveDraft(): InvoiceDetail {
     const draft = this.invoiceRepo.findLatestDraft();
     if (draft) {
+      if (!draft.invoice.invoice_number) {
+        const peek = invoiceNumberingService.peekNextNumber();
+        (draft.invoice as any).next_continuous_number = typeof peek === 'number' ? peek : (peek as any)?.invoiceNumber ?? peek;
+      }
       return draft;
     }
     const newInvoice = this.createDraft({});
@@ -191,6 +201,31 @@ export class InvoiceService {
 
     this.invoiceRepo.updateItemQty(
       itemId, quantityGrams, quantityUnits, lineSubtotalPaise, lineTotalPaise
+    );
+
+    return this.getInvoice(dbItem.invoice_id);
+  }
+
+  public updateItemRate(itemId: number, ratePaise: number, reason?: string) {
+    const dbItem = this.invoiceRepo.findItemById(itemId);
+    const { invoice } = this.invoiceRepo.findById(dbItem.invoice_id);
+    if (invoice.status !== 'draft' && invoice.status !== 'held') {
+      throw new ConflictError('Items can only be modified on draft or held invoices');
+    }
+
+    const variant = this.productRepo.findVariantById(dbItem.product_variant_id);
+    const unitType = variant.unit_type;
+
+    const lineSubtotalPaise = pricingService.calculateLineSubtotal(
+      unitType, dbItem.quantity_grams, dbItem.quantity_units, ratePaise
+    );
+
+    const gstRateSnapshot = invoice.is_gst_invoice === 1 ? dbItem.gst_rate_percent_snapshot : null;
+    const { lineTaxPaise } = pricingService.calculateLineTax(lineSubtotalPaise, gstRateSnapshot);
+    const lineTotalPaise = lineSubtotalPaise + lineTaxPaise;
+
+    this.invoiceRepo.updateItemRate(
+      itemId, ratePaise, lineSubtotalPaise, lineTotalPaise, reason || 'Manual price override'
     );
 
     return this.getInvoice(dbItem.invoice_id);
@@ -592,37 +627,219 @@ export class InvoiceService {
         .reduce((total, payment) => total + payment.amount_paise, 0);
       cashBoxService.recordCashSale(invoiceId, invoiceNumber, cashPaidPaise, this.getCurrentUserId());
 
+      // Post balanced Double-Entry Ledger rows for completed sale
+      if (finalNetTotalPaise > 0) {
+        try {
+          const voucherGroupId = `SALE-${invoiceId}-${Date.now()}`;
+          const entryDate = new Date().toISOString().slice(0, 10);
+          const custRow = invoice.customer_id
+            ? (db.prepare('SELECT name FROM customers WHERE id = ?').get(invoice.customer_id) as { name: string } | undefined)
+            : undefined;
+          const partyName = custRow?.name || 'Walk-in Customer';
+          const insertLedger = db.prepare(`
+            INSERT INTO accounting_daily_ledger (
+              date, reference_id, description,
+              debit_paise, credit_paise, account_type, created_by,
+              voucher_group_id, party_type, party_id, party_name, source_module
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Customer', ?, ?, 'BILLING')
+          `);
+
+          // Credit Sales Revenue
+          insertLedger.run(
+            entryDate,
+            `INV-${invoiceNumber}`,
+            `POS Sale Bill #${invoiceNumber} (${partyName})`,
+            0,
+            finalNetTotalPaise,
+            'Sales',
+            this.getCurrentUserId() || 1,
+            voucherGroupId,
+            invoice.customer_id ?? null,
+            partyName
+          );
+
+          // Debit Cash / Bank / Customer Accounts Receivable
+          const nonCashPaidPaise = Math.max(0, paidAmount - cashPaidPaise);
+          if (cashPaidPaise > 0) {
+            insertLedger.run(
+              entryDate,
+              `INV-${invoiceNumber}`,
+              `Cash received for Bill #${invoiceNumber}`,
+              Math.min(cashPaidPaise, finalNetTotalPaise),
+              0,
+              'Cash',
+              this.getCurrentUserId() || 1,
+              voucherGroupId,
+              invoice.customer_id ?? null,
+              partyName
+            );
+          }
+          if (nonCashPaidPaise > 0) {
+            insertLedger.run(
+              entryDate,
+              `INV-${invoiceNumber}`,
+              `UPI/Card received for Bill #${invoiceNumber}`,
+              nonCashPaidPaise,
+              0,
+              'Bank',
+              this.getCurrentUserId() || 1,
+              voucherGroupId,
+              invoice.customer_id ?? null,
+              partyName
+            );
+          }
+          if (creditAmount > 0) {
+            insertLedger.run(
+              entryDate,
+              `INV-${invoiceNumber}`,
+              `Udhaar / Credit receivable for Bill #${invoiceNumber} (${partyName})`,
+              creditAmount,
+              0,
+              'Customer',
+              this.getCurrentUserId() || 1,
+              voucherGroupId,
+              invoice.customer_id ?? null,
+              partyName
+            );
+          }
+        } catch (ledgerErr) {
+          logger.warn('Failed to post double-entry sale ledger rows', { error: String(ledgerErr) });
+        }
+      }
+
       for (const item of items) {
-        const ledger = this.inventoryRepo.findLedgerByVariantId(item.product_variant_id);
-        const variant = this.productRepo.findVariantById(item.product_variant_id);
-        const isWeight = variant.unit_type === 'weight' || variant.unit_type === 'live_dual';
-        const available = ledger ? (isWeight ? (ledger.quantity_grams ?? 0) : (ledger.quantity_units ?? 0)) : 0;
-        const requested = isWeight ? (item.quantity_grams ?? 0) : (item.quantity_units ?? 0);
-        
+        // Target Design C: Resolve product stock mode and stock product
+        const prodInfo = db.prepare(`
+          SELECT p.id as product_id, p.name as product_name, p.stock_mode, p.parent_product_id,
+                 p.link_mode, p.yield_g_per_kg, p.parent_units_per_sale_unit,
+                 pv.unit_type, pv.variant_name
+          FROM product_variants pv
+          JOIN products p ON p.id = pv.product_id
+          WHERE pv.id = ?
+        `).get(item.product_variant_id) as any;
+
+        if (!prodInfo) {
+          throw new ValidationError(`Product not found for line item variant #${item.product_variant_id}`);
+        }
+
+        const isWeight = prodInfo.unit_type === 'weight' || prodInfo.unit_type === 'live_dual' || prodInfo.unit_type === 'kg' || prodInfo.unit_type === 'g';
+
+        let stockProductId: number | null = null;
+        let stockLinkMode: string = prodInfo.stock_mode || 'OWN';
+        let conversionRateUsed: number = 0;
+        let deductedQty: number = 0; // integer grams or pieces
+
+        if (prodInfo.stock_mode === 'NONE') {
+          stockProductId = null;
+          stockLinkMode = 'NONE';
+          conversionRateUsed = 0;
+          deductedQty = 0;
+        } else if (prodInfo.stock_mode === 'LINKED') {
+          if (!prodInfo.parent_product_id) {
+            throw new ValidationError(`Linked product "${prodInfo.product_name}" is missing a parent product.`);
+          }
+          const parent = db.prepare('SELECT id, name, stock_mode, is_active, unit_type FROM products WHERE id = ?').get(prodInfo.parent_product_id) as any;
+          if (!parent || parent.is_active === 0 || parent.stock_mode !== 'OWN') {
+            throw new ValidationError(`Parent product for "${prodInfo.product_name}" is invalid or not an active OWN product.`);
+          }
+          stockProductId = parent.id;
+          stockLinkMode = prodInfo.link_mode || 'YIELD';
+
+          if (stockLinkMode === 'YIELD') {
+            conversionRateUsed = prodInfo.yield_g_per_kg || 0;
+            if (conversionRateUsed <= 0) {
+              throw new ValidationError(`Product "${prodInfo.product_name}" has invalid yield ratio (${conversionRateUsed} g/kg).`);
+            }
+            const soldGrams = isWeight ? Math.abs(item.quantity_grams ?? 0) : Math.abs(item.quantity_units ?? 0) * 1000;
+            // Formula: Parent grams deducted = ROUND_HALF_UP(sold_g * 1000 / yield_g_per_kg)
+            deductedQty = roundHalfUp((soldGrams * 1000) / conversionRateUsed);
+          } else if (stockLinkMode === 'PACK') {
+            conversionRateUsed = prodInfo.parent_units_per_sale_unit || 0;
+            if (conversionRateUsed <= 0) {
+              throw new ValidationError(`Product "${prodInfo.product_name}" has invalid pack size (${conversionRateUsed}).`);
+            }
+            const soldUnits = !isWeight ? Math.abs(item.quantity_units ?? 0) : Math.round(Math.abs(item.quantity_grams ?? 0) / 1000);
+            deductedQty = soldUnits * conversionRateUsed;
+          } else {
+            throw new ValidationError(`Unknown link_mode "${stockLinkMode}" for product "${prodInfo.product_name}".`);
+          }
+        } else {
+          // 'OWN' mode (default)
+          stockProductId = prodInfo.product_id;
+          stockLinkMode = 'OWN';
+          conversionRateUsed = 1000;
+          deductedQty = isWeight ? Math.abs(item.quantity_grams ?? 0) : Math.abs(item.quantity_units ?? 0);
+        }
+
+        // Negative stock check on stock_movements ledger
+        if (stockProductId && deductedQty > 0) {
+          const smRow = db.prepare('SELECT COALESCE(SUM(qty_delta), 0) as on_hand FROM stock_movements WHERE product_id = ?').get(stockProductId) as any;
+          const currentOnHand = smRow ? Number(smRow.on_hand) : 0;
+
+          if (currentOnHand < deductedQty) {
+            const policyRow = db.prepare("SELECT value FROM system_settings WHERE key = 'negative_stock_policy'").get() as { value: string } | undefined;
+            const negativePolicy = policyRow?.value || 'block'; // Default BLOCK
+
+            if (negativePolicy === 'block' && !input.allow_negative_stock_override) {
+              const targetProd = db.prepare('SELECT name, unit_type FROM products WHERE id = ?').get(stockProductId) as any;
+              const isTargetWeight = targetProd?.unit_type === 'weight' || targetProd?.unit_type === 'kg' || targetProd?.unit_type === 'live_dual';
+              const availStr = isTargetWeight ? (Math.max(0, currentOnHand) / 1000).toFixed(3) + ' kg' : Math.max(0, currentOnHand) + ' pcs';
+              const reqStr = isTargetWeight ? (deductedQty / 1000).toFixed(3) + ' kg' : deductedQty + ' pcs';
+              throw new ValidationError(
+                `Insufficient stock for "${targetProd?.name || prodInfo.product_name}": stock is ${availStr}, selling ${reqStr}. Blocked by negative stock policy.`
+              );
+            }
+
+            const managerId = this.getCurrentUserId() || 1;
+            const reason = input.override_reason || 'Stock shortage approved by manager';
+            const shortfall = Math.max(0, deductedQty - currentOnHand);
+
+            try {
+              this.inventoryRepo.logOversold({
+                invoice_id: invoiceId,
+                invoice_item_id: item.id,
+                product_variant_id: item.product_variant_id,
+                shortfall_grams: isWeight ? shortfall : null,
+                shortfall_units: !isWeight ? shortfall : null,
+                manager_id: managerId,
+                override_reason: reason
+              });
+            } catch (e) {}
+          }
+
+          // Write movement to stock_movements ledger
+          db.prepare(`
+            INSERT INTO stock_movements (
+              product_id, qty_delta, movement_type, ref_type, ref_id, invoice_line_id, reason_code, note, user_id, created_at
+            ) VALUES (?, ?, 'SALE', 'invoice_line', ?, ?, 'sale', ?, ?, CURRENT_TIMESTAMP)
+          `).run(
+            stockProductId,
+            -deductedQty,
+            item.id,
+            item.id,
+            `POS Sale Bill #${invoiceNumber}`,
+            this.getCurrentUserId() || 1
+          );
+        }
+
+        // Snapshot to invoice_items
+        db.prepare(`
+          UPDATE invoice_items
+          SET stock_product_id = ?,
+              stock_link_mode = ?,
+              conversion_rate_used = ?,
+              deducted_qty = ?
+          WHERE id = ?
+        `).run(
+          stockProductId,
+          stockLinkMode,
+          conversionRateUsed,
+          deductedQty,
+          item.id
+        );
+
         let deductGrams = item.quantity_grams;
         let deductUnits = item.quantity_units;
-
-        if (requested > available) {
-          const managerId = this.getCurrentUserId() || 1;
-          const reason = input.override_reason || 'Stock shortage auto-approved';
-
-          // Cap the stock deduction at the available amount (so stock stops exactly at 0)
-          deductGrams = isWeight ? Math.max(0, available) : null;
-          deductUnits = !isWeight ? Math.max(0, available) : null;
-
-          const shortfall = Math.max(0, requested - Math.max(0, available));
-          if (shortfall > 0) {
-            this.inventoryRepo.logOversold({
-              invoice_id: invoiceId,
-              invoice_item_id: item.id,
-              product_variant_id: item.product_variant_id,
-              shortfall_grams: isWeight ? shortfall : null,
-              shortfall_units: !isWeight ? shortfall : null,
-              manager_id: managerId,
-              override_reason: reason
-            });
-          }
-        }
 
         const manualAllocations = (item as any).manual_batch_allocations;
         let isManualSelected = 0;
@@ -634,54 +851,291 @@ export class InvoiceService {
         let targetVariantId = item.product_variant_id;
         let drawGrams = deductGrams;
         let drawUnits = deductUnits;
-        let yieldRatioUsed = 1;
+        // Check if product is mapped to a live animal in live_yield_ratios
+        const yieldRatioRow = db.prepare(`
+          SELECT lyr.*, layc.live_tracking_enabled, layc.track_byproducts
+          FROM live_yield_ratios lyr
+          JOIN live_animal_yield_configs layc ON layc.animal_key = lyr.animal_key
+          WHERE lyr.variant_id = ?
+        `).get(item.product_variant_id) as any;
 
-        if (manualAllocations && Array.isArray(manualAllocations) && manualAllocations.length > 0 && targetVariantId === item.product_variant_id) {
-          isManualSelected = 1;
-          for (const alloc of manualAllocations) {
-            const batch = db.prepare('SELECT * FROM product_stock_batches WHERE id = ?').get(alloc.batch_id) as any;
-            if (!batch) continue;
+        const isMainCut = yieldRatioRow && yieldRatioRow.role === 'MAIN_CUT' && yieldRatioRow.live_tracking_enabled === 1 && yieldRatioRow.grams_per_kg_live > 0;
 
-            const allocDrawGrams = isWeight ? Math.abs(alloc.quantity_grams ?? 0) : null;
-            const allocDrawUnits = !isWeight ? Math.abs(alloc.quantity_units ?? 0) : null;
+        if (isMainCut) {
+          // Rule: Use product's own on-hand stock first (no live deduction for that portion)
+          // For weight cuts: soldGrams = quantity_grams; For piece cuts: soldGrams = quantity_units * grams_per_kg_live
+          const soldGrams = isWeight 
+            ? Math.abs(item.quantity_grams ?? 0) 
+            : Math.abs(item.quantity_units ?? 0) * yieldRatioRow.grams_per_kg_live;
+          const soldUnits = !isWeight ? Math.abs(item.quantity_units ?? 0) : null;
 
-            const newGrams = isWeight ? Math.max(0, (batch.current_quantity_grams ?? 0) - (allocDrawGrams ?? 0)) : null;
-            const newUnits = !isWeight ? Math.max(0, (batch.current_quantity_units ?? 0) - (allocDrawUnits ?? 0)) : null;
+          const ownOnHandGrams = inventoryLedgerService.getStockOnHand(item.product_variant_id).quantity_grams ?? 0;
+          const ownOnHandUnits = inventoryLedgerService.getStockOnHand(item.product_variant_id).quantity_units ?? 0;
+          const ownAvailable = isWeight ? Math.max(0, ownOnHandGrams) : Math.max(0, ownOnHandUnits);
+          const requested = isWeight ? soldGrams : (soldUnits ?? 0);
+          const drawFromOwn = Math.min(ownAvailable, requested);
+          const remainingRequested = Math.max(0, requested - drawFromOwn);
 
-            const isExhausted = (isWeight && newGrams! <= 0) || (!isWeight && newUnits! <= 0);
+          const drawFromOwnGrams = isWeight ? drawFromOwn : (drawFromOwn * yieldRatioRow.grams_per_kg_live);
+          const remainingSoldGrams = isWeight ? remainingRequested : (remainingRequested * yieldRatioRow.grams_per_kg_live);
 
-            db.prepare(`
-              UPDATE product_stock_batches
-              SET current_quantity_grams = ?, current_quantity_units = ?, status = ?, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `).run(newGrams, newUnits, isExhausted ? 'exhausted' : 'active', batch.id);
+          // 1. Draw down own stock if any
+          if (drawFromOwn > 0) {
+            const fifoOwn = fifoService.drawdownFifo(item.product_variant_id, isWeight ? drawFromOwn : null, !isWeight ? drawFromOwn : null);
+            totalItemCogsPaise += fifoOwn.total_cogs_paise;
+            realCogsPaise += fifoOwn.real_cogs_paise;
+            estimatedCogsPaise += fifoOwn.estimated_cogs_paise;
+            if (fifoOwn.is_estimated_cogs) isEstimatedCogs = 1;
 
-            const batchCogs = isWeight ? Math.round(((allocDrawGrams ?? 0) / 1000) * batch.unit_cost_paise) : ((allocDrawUnits ?? 0) * batch.unit_cost_paise);
-            realCogsPaise += batchCogs;
+            const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+            inventoryLedgerService.recordEntry({
+              product_variant_id: item.product_variant_id,
+              branch_id: 1,
+              action_type: 'sale',
+              quantity_grams: isWeight ? -drawFromOwn : null,
+              quantity_units: !isWeight ? -drawFromOwn : null,
+              unit_cost_paise: item.rate_paise_snapshot,
+              reference_type: 'invoice',
+              reference_id: invoiceId,
+              reference_number: invoiceNumber,
+              notes: `POS Sale Bill #${invoiceNumber} (from own stock)`,
+              created_by: this.getCurrentUserId(),
+            });
 
-            try {
-              db.prepare(`
-                INSERT INTO invoice_item_batch_allocations (
-                  invoice_item_id, batch_id, quantity_grams, quantity_units, unit_cost_paise
-                ) VALUES (?, ?, ?, ?, ?)
-              `).run(item.id, batch.id, allocDrawGrams, allocDrawUnits, batch.unit_cost_paise);
-            } catch (e) {
-              // Ignore if table check
-            }
+            this.inventoryRepo.createTransaction({
+              product_variant_id: item.product_variant_id,
+              transaction_type: 'sale_deduction',
+              quantity_grams: isWeight ? -drawFromOwn : null,
+              quantity_units: !isWeight ? -drawFromOwn : null,
+              reference_id: invoiceId
+            });
           }
 
-          totalItemCogsPaise = realCogsPaise;
-          fifoService.syncLedgerBalance(item.product_variant_id);
+          // 2. Remaining grams deducted from live pool of animal_key
+          if (remainingSoldGrams > 0) {
+            // live_grams = roundHalfUp(sold_grams * 1000 / grams_per_kg_live)
+            const liveGramsToDeduct = roundHalfUp((remainingSoldGrams * 1000) / yieldRatioRow.grams_per_kg_live);
+            let unfulfilledLiveGrams = liveGramsToDeduct;
+
+            // Draw FIFO from live_chicken_batches for animal_type
+            const liveBatches = db.prepare(`
+              SELECT * FROM live_chicken_batches
+              WHERE animal_type = ? AND status = 'active' AND remaining_weight_grams > 0
+              ORDER BY purchase_date ASC, id ASC
+            `).all(yieldRatioRow.animal_key) as any[];
+
+            for (const b of liveBatches) {
+              if (unfulfilledLiveGrams <= 0) break;
+              const deductGramsFromBatch = Math.min(b.remaining_weight_grams, unfulfilledLiveGrams);
+              const ratio = deductGramsFromBatch / (b.remaining_weight_grams || 1);
+              const currentMilli = (b.remaining_count_milli !== null && b.remaining_count_milli !== undefined) ? b.remaining_count_milli : (b.remaining_count * 1000);
+              const deductMilli = Math.round(currentMilli * ratio);
+
+              const newWeight = b.remaining_weight_grams - deductGramsFromBatch;
+              const newCountMilli = Math.max(0, currentMilli - deductMilli);
+              const newCount = Math.floor(newCountMilli / 1000);
+              const newStatus = (newWeight <= 0) ? 'exhausted' : 'active';
+
+              db.prepare(`
+                UPDATE live_chicken_batches
+                SET remaining_weight_grams = ?, remaining_count = ?, remaining_count_milli = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(newWeight, newCount, newCountMilli, newStatus, b.id);
+
+              const batchCogs = Math.round((deductGramsFromBatch / 1000) * b.cost_per_kg_paise);
+              totalItemCogsPaise += batchCogs;
+              realCogsPaise += batchCogs;
+
+              // Insert exact per-sale deduction row
+              const soldGramsPortion = roundHalfUp((deductGramsFromBatch * yieldRatioRow.grams_per_kg_live) / 1000);
+              db.prepare(`
+                INSERT INTO live_animal_sale_deductions (
+                  invoice_id, invoice_item_id, batch_id, animal_type, sold_product_variant_id,
+                  sold_grams, live_grams_deducted, count_milli_deducted, ratio_snapshot_used
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                invoiceId,
+                item.id,
+                b.id,
+                yieldRatioRow.animal_key,
+                item.product_variant_id,
+                soldGramsPortion,
+                deductGramsFromBatch,
+                deductMilli,
+                yieldRatioRow.grams_per_kg_live
+              );
+
+              unfulfilledLiveGrams -= deductGramsFromBatch;
+            }
+
+            // If pool is short: still save bill, allow negative pool on the latest batch or create negative batch
+            if (unfulfilledLiveGrams > 0) {
+              const lastBatch = db.prepare(`SELECT id, remaining_weight_grams, remaining_count, cost_per_kg_paise FROM live_chicken_batches WHERE animal_type = ? ORDER BY id DESC LIMIT 1`).get(yieldRatioRow.animal_key) as any;
+              let deficitBatchId = lastBatch?.id;
+              let costPaise = lastBatch?.cost_per_kg_paise || 0;
+
+              if (lastBatch) {
+                db.prepare(`
+                  UPDATE live_chicken_batches
+                  SET remaining_weight_grams = remaining_weight_grams - ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+                  WHERE id = ?
+                `).run(unfulfilledLiveGrams, lastBatch.id);
+              } else {
+                const batchNum = `NEG-${yieldRatioRow.animal_key.toUpperCase()}-${Date.now().toString().slice(-6)}`;
+                const insRes = db.prepare(`
+                  INSERT INTO live_chicken_batches (
+                    batch_number, animal_type, supplier_id, purchase_date,
+                    cost_per_kg_paise, initial_weight_grams, initial_count,
+                    remaining_weight_grams, remaining_count, remaining_count_milli, status, notes
+                  ) VALUES (?, ?, 1, CURRENT_TIMESTAMP, 0, 0, 0, ?, 0, 0, 'active', 'Auto-created negative pool')
+                `).run(batchNum, yieldRatioRow.animal_key, -unfulfilledLiveGrams);
+                deficitBatchId = Number(insRes.lastInsertRowid);
+              }
+
+              const soldGramsPortion = roundHalfUp((unfulfilledLiveGrams * yieldRatioRow.grams_per_kg_live) / 1000);
+              db.prepare(`
+                INSERT INTO live_animal_sale_deductions (
+                  invoice_id, invoice_item_id, batch_id, animal_type, sold_product_variant_id,
+                  sold_grams, live_grams_deducted, count_milli_deducted, ratio_snapshot_used
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                invoiceId,
+                item.id,
+                deficitBatchId,
+                yieldRatioRow.animal_key,
+                item.product_variant_id,
+                soldGramsPortion,
+                unfulfilledLiveGrams,
+                0,
+                yieldRatioRow.grams_per_kg_live
+              );
+
+              estimatedCogsPaise += Math.round((unfulfilledLiveGrams / 1000) * costPaise);
+              isEstimatedCogs = 1;
+              totalItemCogsPaise += Math.round((unfulfilledLiveGrams / 1000) * costPaise);
+            }
+
+            // Synchronize mapped live animal product variant in stock ledger
+            const liveConfig = db.prepare('SELECT live_variant_id FROM live_animal_yield_configs WHERE animal_key = ?').get(yieldRatioRow.animal_key) as any;
+            if (liveConfig?.live_variant_id) {
+              const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+              inventoryLedgerService.recordMovement({
+                product_variant_id: liveConfig.live_variant_id,
+                branch_id: 1,
+                action_type: 'YIELD_OUT',
+                quantity_grams: -liveGramsToDeduct,
+                quantity_units: null,
+                reference_type: 'invoice',
+                reference_id: invoiceId,
+                reference_number: invoiceNumber,
+                notes: `Live animal consumption (${yieldRatioRow.animal_key}) for Cut #${item.product_variant_id} on POS Sale #${invoiceNumber}`,
+                created_by: this.getCurrentUserId(),
+              });
+            }
+
+            // By-product credit: when live grams are consumed, credit each BYPRODUCT product's stock at its ratio
+            if (yieldRatioRow.track_byproducts === 1) {
+              const byproducts = db.prepare(`
+                SELECT * FROM live_yield_ratios
+                WHERE animal_key = ? AND role = 'BYPRODUCT' AND grams_per_kg_live > 0
+              `).all(yieldRatioRow.animal_key) as any[];
+
+              const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+              for (const bp of byproducts) {
+                const bpVariant = db.prepare('SELECT unit_type FROM product_variants WHERE id = ?').get(bp.variant_id) as any;
+                const isBpWeight = bpVariant?.unit_type === 'weight' || bpVariant?.unit_type === 'live_dual';
+                const bpGrams = isBpWeight ? roundHalfUp((liveGramsToDeduct * bp.grams_per_kg_live) / 1000) : null;
+                const bpUnits = !isBpWeight ? roundHalfUp((liveGramsToDeduct * bp.grams_per_kg_live) / 1000) : null;
+
+                if ((bpGrams && bpGrams > 0) || (bpUnits && bpUnits > 0)) {
+                  inventoryLedgerService.recordMovement({
+                    product_variant_id: bp.variant_id,
+                    branch_id: 1,
+                    action_type: 'STOCK_ADJUSTMENT',
+                    quantity_grams: bpGrams,
+                    quantity_units: bpUnits,
+                    reference_type: 'yield_byproduct',
+                    reference_id: invoiceId,
+                    reference_number: invoiceNumber,
+                    notes: `Byproduct credit (${yieldRatioRow.animal_key}) from POS Sale #${invoiceNumber}`,
+                    created_by: this.getCurrentUserId(),
+                  });
+                }
+              }
+            }
+          }
         } else {
-          // Execute FIFO Drawdown across active batches
-          const fifoRes = fifoService.drawdownFifo(targetVariantId, isWeight ? drawGrams : null, !isWeight ? drawUnits : null);
-          // Scale down COGS to match the sold item's weight if yield was used, wait! 
-          // If 1kg Boneless uses 1.54kg Whole Chicken, the COGS of that Boneless sale is the cost of 1.54kg Whole Chicken.
-          // The FIFO function returns the COGS for 1.54kg Whole Chicken! So we just use it directly!
-          totalItemCogsPaise = fifoRes.total_cogs_paise;
-          realCogsPaise = fifoRes.real_cogs_paise;
-          estimatedCogsPaise = fifoRes.estimated_cogs_paise;
-          isEstimatedCogs = fifoRes.is_estimated_cogs;
+          // Standard / Direct item drawdown
+          if (manualAllocations && Array.isArray(manualAllocations) && manualAllocations.length > 0 && targetVariantId === item.product_variant_id) {
+            isManualSelected = 1;
+            for (const alloc of manualAllocations) {
+              const batch = db.prepare('SELECT * FROM product_stock_batches WHERE id = ?').get(alloc.batch_id) as any;
+              if (!batch) continue;
+
+              const allocDrawGrams = isWeight ? Math.abs(alloc.quantity_grams ?? 0) : null;
+              const allocDrawUnits = !isWeight ? Math.abs(alloc.quantity_units ?? 0) : null;
+
+              const newGrams = isWeight ? Math.max(0, (batch.current_quantity_grams ?? 0) - (allocDrawGrams ?? 0)) : null;
+              const newUnits = !isWeight ? Math.max(0, (batch.current_quantity_units ?? 0) - (allocDrawUnits ?? 0)) : null;
+
+              const isExhausted = (isWeight && newGrams! <= 0) || (!isWeight && newUnits! <= 0);
+
+              db.prepare(`
+                UPDATE product_stock_batches
+                SET current_quantity_grams = ?, current_quantity_units = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(newGrams, newUnits, isExhausted ? 'exhausted' : 'active', batch.id);
+
+              const batchCogs = isWeight ? Math.round(((allocDrawGrams ?? 0) / 1000) * batch.unit_cost_paise) : ((allocDrawUnits ?? 0) * batch.unit_cost_paise);
+              realCogsPaise += batchCogs;
+
+              try {
+                db.prepare(`
+                  INSERT INTO invoice_item_batch_allocations (
+                    invoice_item_id, batch_id, quantity_grams, quantity_units, unit_cost_paise
+                  ) VALUES (?, ?, ?, ?, ?)
+                `).run(item.id, batch.id, allocDrawGrams, allocDrawUnits, batch.unit_cost_paise);
+              } catch (e) {}
+            }
+
+            totalItemCogsPaise = realCogsPaise;
+            fifoService.syncLedgerBalance(item.product_variant_id);
+          } else {
+            // Execute FIFO Drawdown across active batches
+            const fifoRes = fifoService.drawdownFifo(targetVariantId, isWeight ? drawGrams : null, !isWeight ? drawUnits : null);
+            totalItemCogsPaise = fifoRes.total_cogs_paise;
+            realCogsPaise = fifoRes.real_cogs_paise;
+            estimatedCogsPaise = fifoRes.estimated_cogs_paise;
+            isEstimatedCogs = fifoRes.is_estimated_cogs;
+          }
+
+          const deltaGrams = isWeight ? -(Math.abs(deductGrams ?? 0)) : null;
+          const deltaUnits = !isWeight ? -(Math.abs(deductUnits ?? 0)) : null;
+
+          // Track transaction log
+          this.inventoryRepo.createTransaction({
+            product_variant_id: item.product_variant_id,
+            transaction_type: 'sale_deduction',
+            quantity_grams: deltaGrams,
+            quantity_units: deltaUnits,
+            reference_id: invoiceId
+          });
+
+          // Record unified inventory_ledger entry
+          const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+          inventoryLedgerService.recordEntry({
+            product_variant_id: item.product_variant_id,
+            branch_id: 1,
+            action_type: 'sale',
+            quantity_grams: deltaGrams,
+            quantity_units: deltaUnits,
+            unit_cost_paise: item.rate_paise_snapshot,
+            reference_type: 'invoice',
+            reference_id: invoiceId,
+            reference_number: invoiceNumber,
+            notes: `POS Sale Bill #${invoiceNumber}`,
+            created_by: this.getCurrentUserId(),
+          });
         }
 
         // Update fifo_cogs_paise, real_cogs_paise, estimated_cogs_paise, is_estimated_cogs, and is_manual_batch_selected on invoice_item
@@ -702,34 +1156,6 @@ export class InvoiceService {
             WHERE id = ?
           `).run(totalItemCogsPaise, isManualSelected, item.id);
         }
-
-        const deltaGrams = isWeight ? -(Math.abs(deductGrams ?? 0)) : null;
-        const deltaUnits = !isWeight ? -(Math.abs(deductUnits ?? 0)) : null;
-
-        // Track transaction log
-        this.inventoryRepo.createTransaction({
-          product_variant_id: item.product_variant_id,
-          transaction_type: 'sale_deduction',
-          quantity_grams: deltaGrams,
-          quantity_units: deltaUnits,
-          reference_id: invoiceId
-        });
-
-        // Record unified inventory_ledger entry
-        const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
-        inventoryLedgerService.recordEntry({
-          product_variant_id: item.product_variant_id,
-          branch_id: 1,
-          action_type: 'sale',
-          quantity_grams: deltaGrams,
-          quantity_units: deltaUnits,
-          unit_cost_paise: item.rate_paise_snapshot,
-          reference_type: 'invoice',
-          reference_id: invoiceId,
-          reference_number: invoiceNumber,
-          notes: `POS Sale Bill #${invoiceNumber}`,
-          created_by: this.getCurrentUserId(),
-        });
       }
 
       auditLogger.log(
@@ -810,38 +1236,127 @@ export class InvoiceService {
         let revGrams = item.quantity_grams;
         let revUnits = item.quantity_units;
 
+        // Check if item had live animal deductions
+        const liveDeductions = db.prepare(`
+          SELECT * FROM live_animal_sale_deductions WHERE invoice_item_id = ?
+        `).all(item.id) as any[];
 
+        if (liveDeductions && liveDeductions.length > 0) {
+          let totalLiveGramsRestored = 0;
+          let animalKey = liveDeductions[0].animal_type;
 
-        // Atomic stock reversal on invoice void
-        const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
-        inventoryLedgerService.recordMovement({
-          product_variant_id: targetVariantId,
-          branch_id: 1,
-          action_type: 'STOCK_ADJUSTMENT',
-          quantity_grams: revGrams,
-          quantity_units: revUnits,
-          reference_type: 'invoice',
-          reference_id: parsed.data.invoice_id,
-          reference_number: invoice.invoice_number,
-          reason_code: 'unrecorded_sale',
-          notes: `Reversal of voided invoice #${invoice.invoice_number}: ${parsed.data.void_reason}`,
-          created_by: parsed.data.voided_by,
-        });
-
-        // Restore batch stock if allocations existed
-        try {
-          const allocs = db.prepare('SELECT * FROM invoice_item_batch_allocations WHERE invoice_item_id = ?').all(item.id) as any[];
-          for (const al of allocs) {
+          for (const ld of liveDeductions) {
+            // Restore exact live_grams_deducted and count_milli_deducted into the exact batch_id
             db.prepare(`
-              UPDATE product_stock_batches SET
-                current_quantity_grams = CASE WHEN current_quantity_grams IS NOT NULL THEN current_quantity_grams + ? ELSE NULL END,
-                current_quantity_units = CASE WHEN current_quantity_units IS NOT NULL THEN current_quantity_units + ? ELSE NULL END,
+              UPDATE live_chicken_batches SET
+                remaining_weight_grams = remaining_weight_grams + ?,
+                remaining_count_milli = COALESCE(remaining_count_milli, remaining_count * 1000) + ?,
+                remaining_count = CASE 
+                  WHEN remaining_count_milli IS NOT NULL THEN (remaining_count_milli + ?) / 1000 
+                  ELSE remaining_count + (? / 1000) 
+                END,
                 status = 'active',
                 updated_at = CURRENT_TIMESTAMP
               WHERE id = ?
-            `).run(al.quantity_grams || 0, al.quantity_units || 0, al.batch_id);
+            `).run(ld.live_grams_deducted, ld.count_milli_deducted, ld.count_milli_deducted, ld.count_milli_deducted, ld.batch_id);
+
+            totalLiveGramsRestored += ld.live_grams_deducted;
           }
-        } catch (e) {}
+
+          // Reverse any byproduct credits granted by this sale
+          const byproducts = db.prepare(`
+            SELECT * FROM live_yield_ratios WHERE animal_key = ? AND role = 'BYPRODUCT' AND grams_per_kg_live > 0
+          `).all(animalKey) as any[];
+
+          const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+          for (const bp of byproducts) {
+            const bpGrams = roundHalfUp((totalLiveGramsRestored * bp.grams_per_kg_live) / 1000);
+            if (bpGrams > 0) {
+              inventoryLedgerService.recordMovement({
+                product_variant_id: bp.variant_id,
+                branch_id: 1,
+                action_type: 'STOCK_ADJUSTMENT',
+                quantity_grams: -bpGrams,
+                quantity_units: null,
+                reference_type: 'yield_byproduct_reversal',
+                reference_id: parsed.data.invoice_id,
+                reference_number: invoice.invoice_number,
+                notes: `Byproduct reversal (${animalKey}) for voided invoice #${invoice.invoice_number}`,
+                created_by: parsed.data.voided_by,
+              });
+            }
+          }
+
+          // If item also drew from own stock (total sold_grams > live deductions converted):
+          const totalSoldViaLive = liveDeductions.reduce((sum, d) => sum + d.sold_grams, 0);
+          const ownDrawnGrams = Math.max(0, (revGrams || 0) - totalSoldViaLive);
+          if (ownDrawnGrams > 0) {
+            inventoryLedgerService.recordMovement({
+              product_variant_id: targetVariantId,
+              branch_id: 1,
+              action_type: 'STOCK_ADJUSTMENT',
+              quantity_grams: ownDrawnGrams,
+              quantity_units: null,
+              reference_type: 'invoice',
+              reference_id: parsed.data.invoice_id,
+              reference_number: invoice.invoice_number,
+              reason_code: 'unrecorded_sale',
+              notes: `Reversal of own stock portion of voided invoice #${invoice.invoice_number}`,
+              created_by: parsed.data.voided_by,
+            });
+          }
+        } else {
+          // Standard item atomic stock reversal
+          const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+          inventoryLedgerService.recordMovement({
+            product_variant_id: targetVariantId,
+            branch_id: 1,
+            action_type: 'STOCK_ADJUSTMENT',
+            quantity_grams: revGrams,
+            quantity_units: revUnits,
+            reference_type: 'invoice',
+            reference_id: parsed.data.invoice_id,
+            reference_number: invoice.invoice_number,
+            reason_code: 'unrecorded_sale',
+            notes: `Reversal of voided invoice #${invoice.invoice_number}: ${parsed.data.void_reason}`,
+            created_by: parsed.data.voided_by,
+          });
+
+          // Restore batch stock if allocations existed
+          try {
+            const allocs = db.prepare('SELECT * FROM invoice_item_batch_allocations WHERE invoice_item_id = ?').all(item.id) as any[];
+            for (const al of allocs) {
+              db.prepare(`
+                UPDATE product_stock_batches SET
+                  current_quantity_grams = CASE WHEN current_quantity_grams IS NOT NULL THEN current_quantity_grams + ? ELSE NULL END,
+                  current_quantity_units = CASE WHEN current_quantity_units IS NOT NULL THEN current_quantity_units + ? ELSE NULL END,
+                  status = 'active',
+                  updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(al.quantity_grams || 0, al.quantity_units || 0, al.batch_id);
+            }
+          } catch (e) {}
+        }
+
+        // Target Design C: Reverse saved stock_movements snapshot if recorded
+        if (item.stock_product_id && item.deducted_qty && item.deducted_qty > 0) {
+          try {
+            db.prepare(`
+              INSERT INTO stock_movements (
+                product_id, qty_delta, movement_type, ref_type, ref_id, invoice_line_id, reason_code, note, user_id, created_at
+              ) VALUES (?, ?, 'SALE_CANCEL', 'invoice_line', ?, ?, 'void', ?, ?, CURRENT_TIMESTAMP)
+            `).run(
+              item.stock_product_id,
+              item.deducted_qty, // exact positive reversal
+              item.id,
+              item.id,
+              `Reversal of voided invoice #${invoice.invoice_number}`,
+              parsed.data.voided_by || 1
+            );
+          } catch (e) {
+            logger.warn('Failed to insert stock_movement for void reversal', { error: String(e) });
+          }
+        }
       }
 
       auditLogger.log(
@@ -930,7 +1445,7 @@ export class InvoiceService {
         }
         const refStr = input.reference ? `Ref: ${input.reference}` : 'Direct Return';
         
-        (this.invoiceRepo as any).completeInvoiceStmt = (this.invoiceRepo as any).db.prepare(`
+        const returnUpdateStmt = db.prepare(`
           UPDATE invoices SET
             invoice_number = @invoice_number,
             financial_year = @financial_year,
@@ -953,7 +1468,7 @@ export class InvoiceService {
             completed_at = CURRENT_TIMESTAMP
           WHERE id = @id
         `);
-        (this.invoiceRepo as any).completeInvoiceStmt.run({
+        returnUpdateStmt.run({
            id: targetInvoiceId,
            invoice_number: `RET-${targetInvoiceId}`,
            financial_year: '23-24',
@@ -973,46 +1488,133 @@ export class InvoiceService {
           let deltaUnits = !isWeight ? Math.abs(item.quantity_units ?? 0) : null;
           let targetVariantId = item.product_variant_id;
 
+          // Target Design C: Restore stock using the SAVED deduction in proportion
+          // (saved_deduction * returned_qty / sold_qty, round half up)
+          if (item.invoice_item_id) {
+            const origItem = db.prepare('SELECT * FROM invoice_items WHERE id = ?').get(item.invoice_item_id) as any;
+            if (origItem && origItem.stock_product_id && origItem.deducted_qty > 0) {
+              const origSold = origItem.quantity_grams ?? origItem.quantity_units ?? 1;
+              const retQty = item.quantity_grams ?? item.quantity_units ?? 0;
+              const restoredStockQty = roundHalfUp((origItem.deducted_qty * Math.abs(retQty)) / Math.max(1, Math.abs(origSold)));
+              if (restoredStockQty > 0) {
+                try {
+                  db.prepare(`
+                    INSERT INTO stock_movements (
+                      product_id, qty_delta, movement_type, ref_type, ref_id, invoice_line_id, reason_code, note, user_id, created_at
+                    ) VALUES (?, ?, 'SALE_RETURN', 'invoice_line', ?, ?, 'return', ?, ?, CURRENT_TIMESTAMP)
+                  `).run(
+                    origItem.stock_product_id,
+                    restoredStockQty,
+                    item.invoice_item_id,
+                    item.invoice_item_id,
+                    `Sales return restoration for #${originalInvoiceNumber || targetInvoiceId}`,
+                    managerId || 1
+                  );
+                } catch (smErr) {
+                  logger.warn('Failed to insert stock_movement for sales return', { error: String(smErr) });
+                }
+              }
+            }
+          }
 
+          // Check if the original invoice item had live animal deductions
+          let liveDeductions: any[] = [];
+          if (item.invoice_item_id) {
+            liveDeductions = db.prepare(`
+              SELECT * FROM live_animal_sale_deductions WHERE invoice_item_id = ?
+            `).all(item.invoice_item_id) as any[];
+          } else if (targetInvoiceId) {
+            liveDeductions = db.prepare(`
+              SELECT * FROM live_animal_sale_deductions 
+              WHERE invoice_id = ? AND sold_product_variant_id = ?
+            `).all(targetInvoiceId, targetVariantId) as any[];
+          }
 
-          const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
-          inventoryLedgerService.recordMovement({
-            product_variant_id: targetVariantId,
-            branch_id: 1,
-            action_type: 'SALE_RETURN',
-            quantity_grams: deltaGrams,
-            quantity_units: deltaUnits,
-            unit_cost_paise: item.unit_rate_paise,
-            reference_type: 'invoice',
-            reference_id: targetInvoiceId,
-            reference_number: originalInvoiceNumber,
-            reason_code: 'other',
-            notes: `Sales return restored (${originalInvoiceNumber}) - ${input.reason || 'Restocked'}`,
-            created_by: managerId,
-          });
+          if (liveDeductions && liveDeductions.length > 0) {
+            let totalLiveGramsRestored = 0;
+            let animalKey = liveDeductions[0].animal_type;
 
-          // Also activate a batch in product_stock_batches for FIFO availability
-          try {
-            const cleanDate = new Date().toISOString().slice(0, 10).replace(/[^0-9]/g, '');
-            const retBatchNo = `BAT-RET-${cleanDate}-${targetInvoiceId}-${targetVariantId}-${Math.floor(Math.random()*1000)}`;
-            db.prepare(`
-              INSERT INTO product_stock_batches (
-                batch_number, product_variant_id, received_date, original_batch_date,
-                initial_quantity_grams, initial_quantity_units,
-                current_quantity_grams, current_quantity_units,
-                unit_cost_paise, source_type, source_ref_id, status, location_id
-              ) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, 'adjustment', ?, 'active', 1)
-            `).run(
-              retBatchNo,
-              targetVariantId,
-              deltaGrams,
-              deltaUnits,
-              deltaGrams,
-              deltaUnits,
-              item.unit_rate_paise,
-              targetInvoiceId
-            );
-          } catch (e) {}
+            for (const ld of liveDeductions) {
+              db.prepare(`
+                UPDATE live_chicken_batches SET
+                  remaining_weight_grams = remaining_weight_grams + ?,
+                  remaining_count_milli = COALESCE(remaining_count_milli, remaining_count * 1000) + ?,
+                  remaining_count = CASE 
+                    WHEN remaining_count_milli IS NOT NULL THEN (remaining_count_milli + ?) / 1000 
+                    ELSE remaining_count + (? / 1000) 
+                  END,
+                  status = 'active',
+                  updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+              `).run(ld.live_grams_deducted, ld.count_milli_deducted, ld.count_milli_deducted, ld.count_milli_deducted, ld.batch_id);
+
+              totalLiveGramsRestored += ld.live_grams_deducted;
+            }
+
+            // Reverse byproduct credits
+            const byproducts = db.prepare(`
+              SELECT * FROM live_yield_ratios WHERE animal_key = ? AND role = 'BYPRODUCT' AND grams_per_kg_live > 0
+            `).all(animalKey) as any[];
+
+            const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+            for (const bp of byproducts) {
+              const bpGrams = roundHalfUp((totalLiveGramsRestored * bp.grams_per_kg_live) / 1000);
+              if (bpGrams > 0) {
+                inventoryLedgerService.recordMovement({
+                  product_variant_id: bp.variant_id,
+                  branch_id: 1,
+                  action_type: 'STOCK_ADJUSTMENT',
+                  quantity_grams: -bpGrams,
+                  quantity_units: null,
+                  reference_type: 'yield_byproduct_reversal',
+                  reference_id: targetInvoiceId,
+                  reference_number: originalInvoiceNumber,
+                  notes: `Byproduct reversal (${animalKey}) for returned invoice #${originalInvoiceNumber}`,
+                  created_by: managerId,
+                });
+              }
+            }
+          } else {
+            // Normal product stock return
+            const { inventoryLedgerService } = require('../../../inventory/backend/service/inventory_ledger_service');
+            inventoryLedgerService.recordMovement({
+              product_variant_id: targetVariantId,
+              branch_id: 1,
+              action_type: 'SALE_RETURN',
+              quantity_grams: deltaGrams,
+              quantity_units: deltaUnits,
+              unit_cost_paise: item.unit_rate_paise,
+              reference_type: 'invoice',
+              reference_id: targetInvoiceId,
+              reference_number: originalInvoiceNumber,
+              reason_code: 'other',
+              notes: `Sales return restored (${originalInvoiceNumber}) - ${input.reason || 'Restocked'}`,
+              created_by: managerId,
+            });
+
+            // Also activate a batch in product_stock_batches for FIFO availability
+            try {
+              const cleanDate = new Date().toISOString().slice(0, 10).replace(/[^0-9]/g, '');
+              const retBatchNo = `BAT-RET-${cleanDate}-${targetInvoiceId}-${targetVariantId}-${Math.floor(Math.random()*1000)}`;
+              db.prepare(`
+                INSERT INTO product_stock_batches (
+                  batch_number, product_variant_id, received_date, original_batch_date,
+                  initial_quantity_grams, initial_quantity_units,
+                  current_quantity_grams, current_quantity_units,
+                  unit_cost_paise, source_type, source_ref_id, status, location_id
+                ) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, 'adjustment', ?, 'active', 1)
+              `).run(
+                retBatchNo,
+                targetVariantId,
+                deltaGrams,
+                deltaUnits,
+                deltaGrams,
+                deltaUnits,
+                item.unit_rate_paise,
+                targetInvoiceId
+              );
+            } catch (e) {}
+          }
         }
       } else {
         // Discarded / Spoilage return: log audit movement to ledger without adding back to saleable stock

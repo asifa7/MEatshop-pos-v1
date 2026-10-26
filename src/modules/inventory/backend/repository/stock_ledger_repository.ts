@@ -17,6 +17,8 @@ export interface StockStatusRow extends StockLedgerRow {
   product_code: string;
   category: string;
   unit_type: 'weight' | 'piece';
+  track_in_inventory?: number;
+  is_inventory_tracked?: number;
 }
 
 export const stockLedgerRepository = {
@@ -69,8 +71,24 @@ export const stockLedgerRepository = {
 
   findAll(): StockStatusRow[] {
     return db.prepare(`
-      SELECT sl.*, pv.variant_name, p.name as product_name, p.product_code, p.category, p.unit_type, p.is_inventory_tracked,
-             pv.cost_price_paise_per_unit, pv.current_rate_paise_per_unit, pv.last_purchase_cost, pv.weighted_average_cost,
+      SELECT COALESCE(sl.id, 0) as id,
+             pv.id as product_variant_id,
+             sl.quantity_grams,
+             sl.quantity_units,
+             sl.safety_threshold_grams,
+             sl.safety_threshold_units,
+             COALESCE(sl.updated_at, pv.updated_at, CURRENT_TIMESTAMP) as updated_at,
+             pv.variant_name,
+             p.name as product_name,
+             COALESCE(pv.product_code, p.product_code) as product_code,
+             COALESCE(p.category, 'General') as category,
+             COALESCE(pv.unit_type, p.unit_type, 'weight') as unit_type,
+             p.is_inventory_tracked,
+             COALESCE(pv.track_in_inventory, 1) as track_in_inventory,
+             pv.cost_price_paise_per_unit,
+             pv.current_rate_paise_per_unit,
+             pv.last_purchase_cost,
+             pv.weighted_average_cost,
              (
                SELECT unit_cost_paise 
                FROM product_stock_batches 
@@ -85,10 +103,10 @@ export const stockLedgerRepository = {
                ORDER BY received_date DESC, id DESC 
                LIMIT 1 OFFSET 1
              ) as previous_purchase_rate_paise
-      FROM stock_ledger sl
-      JOIN product_variants pv ON sl.product_variant_id = pv.id
+      FROM product_variants pv
       JOIN products p ON pv.product_id = p.id
-      WHERE pv.is_active = 1 AND p.is_active = 1 AND p.is_inventory_tracked = 1
+      LEFT JOIN stock_ledger sl ON sl.product_variant_id = pv.id
+      WHERE pv.is_active = 1 AND p.is_active = 1 AND COALESCE(pv.track_in_inventory, 1) = 1 AND COALESCE(p.is_inventory_tracked, 1) = 1
       ORDER BY p.name ASC, pv.variant_name ASC
     `).all() as StockStatusRow[];
   },
@@ -97,6 +115,7 @@ export const stockLedgerRepository = {
     return db.prepare(`
       SELECT sl.*, pv.variant_name, p.name as product_name, p.product_code, p.category, p.unit_type, p.is_inventory_tracked,
              pv.cost_price_paise_per_unit, pv.current_rate_paise_per_unit, pv.last_purchase_cost, pv.weighted_average_cost,
+             COALESCE(pv.track_in_inventory, 1) as track_in_inventory,
              (
                SELECT unit_cost_paise 
                FROM product_stock_batches 
@@ -114,7 +133,7 @@ export const stockLedgerRepository = {
       FROM stock_ledger sl
       JOIN product_variants pv ON sl.product_variant_id = pv.id
       JOIN products p ON pv.product_id = p.id
-      WHERE pv.is_active = 1 AND p.is_active = 1 AND p.is_inventory_tracked = 1 AND (
+      WHERE pv.is_active = 1 AND p.is_active = 1 AND COALESCE(pv.track_in_inventory, 1) = 1 AND COALESCE(p.is_inventory_tracked, 1) = 1 AND (
         (p.unit_type = 'weight' AND sl.safety_threshold_grams > 0 AND sl.quantity_grams <= sl.safety_threshold_grams) OR
         (p.unit_type = 'piece' AND sl.safety_threshold_units > 0 AND sl.quantity_units <= sl.safety_threshold_units) OR
         (p.unit_type = 'weight' AND (sl.quantity_grams IS NULL OR sl.quantity_grams <= 0)) OR
@@ -148,6 +167,7 @@ export const stockLedgerRepository = {
     let critical = 0;
 
     const itemsWithStatus = all.map(item => {
+      const isTracked = (item as any).track_in_inventory !== 0 && item.is_inventory_tracked !== 0;
       const isWeight = item.unit_type === 'weight';
       const current = isWeight ? (item.quantity_grams ?? 0) : (item.quantity_units ?? 0);
       const rawThreshold = isWeight ? item.safety_threshold_grams : item.safety_threshold_units;
@@ -157,7 +177,9 @@ export const stockLedgerRepository = {
       let status: 'ok' | 'low' | 'critical' = 'ok';
       let reason: string | undefined;
 
-      if (current <= 0) {
+      if (!isTracked) {
+        status = 'ok'; // Untracked products never flagged as low or critical
+      } else if (current <= 0) {
         status = 'critical';
         critical++;
         reason = current < 0 ? 'Negative stock' : 'Out of stock';
@@ -173,18 +195,21 @@ export const stockLedgerRepository = {
 
       return {
         ...item,
-        currentQty: current,
-        thresholdQty: threshold,
-        ratio,
+        currentQty: isTracked ? current : null,
+        thresholdQty: isTracked ? threshold : null,
+        ratio: isTracked ? ratio : 999,
         status,
         attention_reason: reason,
+        is_tracked: isTracked,
       };
     });
 
     const needsAttention = itemsWithStatus
-      .filter(i => i.status !== 'ok')
+      .filter(i => (i as any).is_tracked && i.status !== 'ok')
       .sort((a, b) => a.ratio - b.ratio)
       .slice(0, 10);
+
+    const trackedTotal = all.filter(i => (i as any).track_in_inventory !== 0 && i.is_inventory_tracked !== 0).length;
 
     const recentMovements = db.prepare(`
       SELECT il.*, pv.variant_name, p.name as product_name, p.unit_type
@@ -196,7 +221,7 @@ export const stockLedgerRepository = {
     `).all() as any[];
 
     return {
-      statusCounts: { ok, low, critical, total: all.length },
+      statusCounts: { ok, low, critical, total: trackedTotal },
       needsAttention,
       recentMovements,
     };

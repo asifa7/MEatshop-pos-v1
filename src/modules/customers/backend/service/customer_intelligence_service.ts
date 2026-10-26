@@ -74,6 +74,10 @@ export interface CustomerIntelligence {
   preferred_visit_time: string;
   customer_lifetime_value_paise: number;
   customer_segment: CustomerSegmentType;
+  tags?: string[];
+  is_credit_customer?: boolean;
+  has_credit_due?: boolean;
+  credit_status?: string;
   segment_health_summary: string;
   credit_limit_paise: number;
   outstanding_balance_paise: number;
@@ -83,6 +87,16 @@ export interface CustomerIntelligence {
 }
 
 export class CustomerIntelligenceService {
+  private includeTestData = false;
+
+  public setIncludeTestData(include: boolean): void {
+    this.includeTestData = include;
+  }
+
+  public getIncludeTestData(): boolean {
+    return this.includeTestData;
+  }
+
   /**
    * Primary method: Get intelligence for a customer from cache or compute live.
    */
@@ -133,18 +147,27 @@ export class CustomerIntelligenceService {
     }
 
     // 1. Invoices chronological list
+    const allowTestInvoices = customer.is_test === 1 || this.includeTestData;
+    const testClause = allowTestInvoices ? '' : 'AND (is_test = 0 OR is_test IS NULL)';
     const invoices = db.prepare(`
       SELECT id, invoice_number, created_at, total_paise, discount_paise, status, payment_status, is_gst_invoice
       FROM invoices
       WHERE customer_id = ? AND status IN ('completed', 'returned')
+        ${testClause}
       ORDER BY created_at ASC, id ASC
     `).all(customerId) as any[];
 
-    const totalVisits = invoices.length;
-    const totalSpendPaise = invoices.reduce((sum, inv) => sum + (inv.total_paise || 0), 0);
-    const averageBillPaise = totalVisits > 0 ? Math.round(totalSpendPaise / totalVisits) : 0;
+    // Extract distinct calendar visit dates (YYYY-MM-DD)
+    const distinctDates = Array.from(new Set(invoices.map(inv => {
+      const d = new Date(inv.created_at);
+      return !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : String(inv.created_at || '').slice(0, 10);
+    }).filter(Boolean))).sort();
 
-    // 2. Visit Timing & Intervals
+    const totalVisits = distinctDates.length;
+    const totalSpendPaise = invoices.reduce((sum, inv) => sum + (inv.total_paise || 0), 0);
+    const averageBillPaise = invoices.length > 0 ? Math.round(totalSpendPaise / invoices.length) : 0;
+
+    // 2. Visit Timing & Intervals (calculated strictly across distinct calendar days)
     let lastPurchaseDate: string | null = null;
     let daysSinceLastPurchase: number | null = null;
     let averageVisitInterval: number | null = null;
@@ -155,23 +178,25 @@ export class CustomerIntelligenceService {
 
     const now = Date.now();
 
-    if (totalVisits > 0) {
-      const lastInv = invoices[invoices.length - 1];
-      lastPurchaseDate = lastInv.created_at;
-      const lastTime = new Date(lastPurchaseDate as string).getTime();
-      daysSinceLastPurchase = Math.max(0, Math.floor((now - lastTime) / (1000 * 60 * 60 * 24)));
+    if (distinctDates.length > 0) {
+      lastPurchaseDate = invoices[invoices.length - 1].created_at;
+      const lastDateStr = distinctDates[distinctDates.length - 1];
+      const lastTime = new Date(`${lastDateStr}T12:00:00Z`).getTime();
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayTime = new Date(`${todayStr}T12:00:00Z`).getTime();
+      daysSinceLastPurchase = Math.max(0, Math.round((todayTime - lastTime) / (1000 * 60 * 60 * 24)));
 
-      if (totalVisits === 1) {
+      if (distinctDates.length === 1) {
         purchaseFrequencyLabel = 'First Visit';
         expectedNextVisit = null;
         daysOverdue = 0;
       } else {
-        // Calculate consecutive intervals in days
+        // Calculate consecutive intervals across distinct calendar dates
         const intervals: number[] = [];
-        for (let i = 1; i < invoices.length; i++) {
-          const prev = new Date(invoices[i - 1].created_at).getTime();
-          const curr = new Date(invoices[i].created_at).getTime();
-          const gapDays = Math.max(0.1, (curr - prev) / (1000 * 60 * 60 * 24));
+        for (let i = 1; i < distinctDates.length; i++) {
+          const prev = new Date(`${distinctDates[i - 1]}T12:00:00Z`).getTime();
+          const curr = new Date(`${distinctDates[i]}T12:00:00Z`).getTime();
+          const gapDays = Math.max(1, Math.round((curr - prev) / (1000 * 60 * 60 * 24)));
           intervals.push(gapDays);
         }
 
@@ -185,12 +210,12 @@ export class CustomerIntelligenceService {
           ? parseFloat(sorted[mid].toFixed(1))
           : parseFloat(((sorted[mid - 1] + sorted[mid]) / 2).toFixed(1));
 
-        // Expected next visit = last purchase date + averageVisitInterval days
+        // Expected next visit = last visit date + Math.round(averageVisitInterval) days
         const expectedTime = lastTime + Math.round(averageVisitInterval * 24 * 60 * 60 * 1000);
         expectedNextVisit = new Date(expectedTime).toISOString().slice(0, 10);
 
-        if (now > expectedTime) {
-          daysOverdue = Math.max(0, Math.floor((now - expectedTime) / (1000 * 60 * 60 * 24)));
+        if (todayTime > expectedTime) {
+          daysOverdue = Math.max(0, Math.round((todayTime - expectedTime) / (1000 * 60 * 60 * 24)));
         }
 
         // Frequency classification
@@ -459,45 +484,128 @@ export class CustomerIntelligenceService {
       };
     }
 
-    // 8. Automated Customer Segmentation
+    // 8. Automated Customer Segmentation (Decoupled lifecycle & credit status)
+    // 8. Automated Customer Segmentation with Configurable Criteria & Manual Override
     let customerSegment: CustomerSegmentType = 'New';
     let segmentHealthSummary = 'New customer — first visits recorded';
 
-    const categoryUpper = (customer.category || '').toUpperCase();
-    const isBusiness = ['HOTEL', 'RESTAURANT', 'WHOLESALE', 'CATERING', 'DISTRIBUTOR'].includes(categoryUpper);
-
-    if (isBusiness) {
-      customerSegment = 'Business Customer';
-      segmentHealthSummary = `🏪 Business Account (${customer.category}) — ${totalVisits} orders, ₹${(totalSpendPaise / 100).toLocaleString('en-IN')} lifetime spend`;
-    } else if (customer.credit_allowed === 1 || creditLedgerInvoices.length >= 3) {
-      customerSegment = 'Credit Customer';
-      segmentHealthSummary = `🧾 Credit Account — Reliability: ${paymentReliability.rating} (${paymentReliability.avg_days_to_pay}d avg payoff)`;
-    } else if (totalSpendPaise >= 1000000 && totalVisits >= 6 && (daysSinceLastPurchase ?? 99) <= (averageVisitInterval || 7) * 1.5) {
-      customerSegment = 'VIP';
-      segmentHealthSummary = `⭐ VIP Customer — High lifetime spend ₹${(totalSpendPaise / 100).toLocaleString('en-IN')} with active ${purchaseFrequencyLabel.toLowerCase()} visits`;
-    } else if (totalVisits <= 1) {
-      customerSegment = 'New';
-      segmentHealthSummary = totalVisits === 0 ? '🆕 New account — no purchases recorded yet' : '🆕 First-time visitor — building visit pattern';
-    } else if (daysSinceLastPurchase != null && averageVisitInterval != null) {
-      if (daysSinceLastPurchase <= averageVisitInterval * 1.25) {
-        customerSegment = 'Regular';
-        segmentHealthSummary = `🟢 Healthy Regular — visits approximately every ${averageVisitInterval} days, last visit ${daysSinceLastPurchase === 0 ? 'today' : `${daysSinceLastPurchase}d ago`}`;
-      } else if (daysSinceLastPurchase <= averageVisitInterval * 2.0) {
-        customerSegment = 'Due';
-        segmentHealthSummary = `🟡 Due for Visit — usually visits every ${averageVisitInterval} days (last purchase was ${daysSinceLastPurchase} days ago)`;
-      } else if (daysSinceLastPurchase <= averageVisitInterval * 3.5 || daysSinceLastPurchase <= 60) {
-        customerSegment = 'At Risk';
-        segmentHealthSummary = `🔴 At Risk of Churn — ${daysSinceLastPurchase} days since last purchase (normal cycle: ${averageVisitInterval} days)`;
-      } else {
-        customerSegment = 'Inactive';
-        segmentHealthSummary = `⚫ Inactive / Lost — no purchases for ${daysSinceLastPurchase} days`;
+    // Load tier settings
+    let tierSettings = {
+      vip_min_spend_paise: 500000,
+      vip_min_visits: 5,
+      vip_criteria_mode: 'either',
+      regular_min_visits: 2,
+      rare_inactive_days: 30,
+      new_window_days: 14,
+      at_risk_gap_multiplier: 2.0,
+      wholesale_tags: 'Wholesale,Distributor,Contract',
+      restaurant_tags: 'Restaurant,Hotel,Catering',
+    };
+    try {
+      const tsRow = db.prepare('SELECT * FROM customer_tier_settings WHERE id = 1').get() as any;
+      if (tsRow) {
+        tierSettings = {
+          ...tierSettings,
+          ...tsRow,
+        };
       }
-    } else if ((daysSinceLastPurchase ?? 0) > 60) {
-      customerSegment = 'Inactive';
-      segmentHealthSummary = `⚫ Inactive — no purchases for ${daysSinceLastPurchase} days`;
+    } catch (_) {}
+
+    const categoryUpper = (customer.category || '').toUpperCase();
+    const wholesaleTagList = String(tierSettings.wholesale_tags || 'Wholesale,Distributor,Contract')
+      .split(',')
+      .map(t => t.trim().toUpperCase())
+      .filter(Boolean);
+    const restaurantTagList = String(tierSettings.restaurant_tags || 'Restaurant,Hotel,Catering')
+      .split(',')
+      .map(t => t.trim().toUpperCase())
+      .filter(Boolean);
+
+    const isWholesale = wholesaleTagList.some(tag => categoryUpper.includes(tag)) || customer.price_tier === 'wholesale';
+    const isRestaurant = restaurantTagList.some(tag => categoryUpper.includes(tag));
+    const isBusiness = isWholesale || isRestaurant;
+
+    const createdAtMs = customer.created_at ? new Date(customer.created_at).getTime() : NaN;
+    const daysSinceAccountCreated = !isNaN(createdAtMs)
+      ? Math.max(0, Math.round((now - createdAtMs) / (1000 * 60 * 60 * 24)))
+      : 0;
+    const isWithinNewWindow = daysSinceAccountCreated <= (tierSettings.new_window_days || 14);
+    const atRiskMultiplier = Number(tierSettings.at_risk_gap_multiplier) > 0 ? Number(tierSettings.at_risk_gap_multiplier) : 2.0;
+
+    // Priority 1: Manual override
+    if (customer.manual_tier && customer.manual_tier !== 'auto') {
+      const mt = customer.manual_tier.toLowerCase();
+      if (mt === 'vip') {
+        customerSegment = 'VIP';
+        segmentHealthSummary = '⭐ Manually assigned VIP customer';
+      } else if (mt === 'wholesale') {
+        customerSegment = 'VIP';
+        segmentHealthSummary = '📦 Wholesale B2B Partner Account';
+      } else if (mt === 'restaurant') {
+        customerSegment = 'VIP';
+        segmentHealthSummary = '🍽️ Restaurant / Food Service Account';
+      } else if (mt === 'rare') {
+        customerSegment = 'Inactive';
+        segmentHealthSummary = '⏳ Rare / Infrequent Buyer';
+      } else if (mt === 'regular') {
+        customerSegment = 'Regular';
+        segmentHealthSummary = '🟢 Manually assigned Regular customer';
+      } else if (mt === 'new') {
+        customerSegment = 'New';
+        segmentHealthSummary = '🆕 Account marked as New customer';
+      }
+    } else if (isWholesale) {
+      customerSegment = 'VIP';
+      segmentHealthSummary = '📦 Wholesale Bulk Account';
+    } else if (isRestaurant) {
+      customerSegment = 'VIP';
+      segmentHealthSummary = '🍽️ Restaurant / Hotel Account';
     } else {
-      customerSegment = 'Regular';
-      segmentHealthSummary = `🟢 Active customer with ${totalVisits} recorded visits`;
+      // Dynamic criteria evaluation
+      const qualifiesVip = customer.price_tier === 'vip' || (
+        tierSettings.vip_criteria_mode === 'both'
+          ? (totalSpendPaise >= tierSettings.vip_min_spend_paise && totalVisits >= tierSettings.vip_min_visits)
+          : (totalSpendPaise >= tierSettings.vip_min_spend_paise || totalVisits >= tierSettings.vip_min_visits)
+      );
+
+      if (qualifiesVip) {
+        customerSegment = 'VIP';
+        segmentHealthSummary = `⭐ VIP Customer — Spend ₹${(totalSpendPaise / 100).toLocaleString('en-IN')} across ${totalVisits} visits`;
+      } else if (totalVisits <= 1 && isWithinNewWindow) {
+        customerSegment = 'New';
+        segmentHealthSummary = totalVisits === 0 ? '🆕 New account — no purchases recorded yet' : '🆕 First-time visitor — building visit pattern';
+      } else if ((daysSinceLastPurchase ?? 0) > tierSettings.rare_inactive_days) {
+        customerSegment = 'Inactive';
+        segmentHealthSummary = `⏳ Rare / Inactive — no purchases for ${daysSinceLastPurchase} days`;
+      } else if (daysSinceLastPurchase != null && averageVisitInterval != null && daysSinceLastPurchase > averageVisitInterval * atRiskMultiplier) {
+        customerSegment = 'At Risk';
+        segmentHealthSummary = `🔴 At Risk of Churn — ${daysSinceLastPurchase} days since last purchase`;
+      } else if (totalVisits >= tierSettings.regular_min_visits) {
+        customerSegment = 'Regular';
+        segmentHealthSummary = `🟢 Healthy Regular — ${totalVisits} visits, last visit ${daysSinceLastPurchase === 0 ? 'today' : `${daysSinceLastPurchase}d ago`}`;
+      } else {
+        customerSegment = 'New';
+        segmentHealthSummary = '🆕 Building repeat habit';
+      }
+    }
+
+    // Overlapping status tags
+    const tags: string[] = [customerSegment];
+    const isCreditCustomer = customer.credit_allowed === 1 || (customer.credit_limit_paise || 0) > 0 || creditLedgerInvoices.length > 0;
+    const hasCreditDue = (customer.outstanding_balance_paise || 0) > 0;
+    let creditStatus = 'No Credit';
+
+    if (isCreditCustomer) {
+      tags.push('Credit Customer');
+      if (hasCreditDue) {
+        creditStatus = paymentReliability.avg_days_to_pay > 30 ? 'Overdue' : 'Credit Due';
+        tags.push(creditStatus);
+      } else {
+        creditStatus = 'Good Standing';
+      }
+    }
+    if (isBusiness) {
+      tags.push('Business');
     }
 
     return {
@@ -526,6 +634,10 @@ export class CustomerIntelligenceService {
       preferred_visit_time: preferredVisitTime,
       customer_lifetime_value_paise: totalSpendPaise,
       customer_segment: customerSegment,
+      tags,
+      is_credit_customer: isCreditCustomer,
+      has_credit_due: hasCreditDue,
+      credit_status: creditStatus,
       segment_health_summary: segmentHealthSummary,
       credit_limit_paise: customer.credit_limit_paise || 0,
       outstanding_balance_paise: customer.outstanding_balance_paise || 0,
@@ -538,7 +650,7 @@ export class CustomerIntelligenceService {
   /**
    * Shop-wide CRM intelligence metrics & alert summary.
    */
-  public getShopCrmAlertsSummary(): {
+  public getShopCrmAlertsSummary(includeTest?: boolean): {
     total_customers: number;
     due_today_count: number;
     at_risk_count: number;
@@ -547,8 +659,14 @@ export class CustomerIntelligenceService {
     regular_count: number;
     shop_avg_visit_interval: number;
   } {
+    const shouldIncludeTest = includeTest ?? this.includeTestData;
+    const testClause = shouldIncludeTest ? '' : 'AND (is_test = 0 OR is_test IS NULL)';
+
     const customers = db.prepare(`
-      SELECT id FROM customers WHERE (status != 'merged' OR status IS NULL)
+      SELECT id FROM customers 
+      WHERE (status != 'merged' OR status IS NULL)
+        ${testClause}
+        AND (is_system = 0 OR is_system IS NULL)
     `).all() as { id: number }[];
 
     let dueToday = 0;
@@ -597,13 +715,20 @@ export class CustomerIntelligenceService {
   public getCustomersNeedingAttention(options?: {
     sortBy?: 'days_overdue' | 'lifetime_value';
     limit?: number;
+    includeTest?: boolean;
   }): any[] {
     const sortBy = options?.sortBy || 'days_overdue';
-    const limit = options?.limit || 50;
+    const limit = options?.limit || 100;
+    const shouldIncludeTest = options?.includeTest ?? this.includeTestData;
+    const testClause = shouldIncludeTest ? '' : 'AND (is_test = 0 OR is_test IS NULL)';
 
     const customers = db.prepare(`
-      SELECT id FROM customers WHERE is_active = 1 AND (status != 'merged' OR status IS NULL)
-    `).all() as { id: number }[];
+      SELECT id, phone, whatsapp_bill_consent, marketing_consent FROM customers 
+      WHERE is_active = 1 
+        AND (status != 'merged' OR status IS NULL)
+        ${testClause}
+        AND (is_system = 0 OR is_system IS NULL)
+    `).all() as any[];
 
     const attentionList: any[] = [];
 
@@ -621,8 +746,15 @@ export class CustomerIntelligenceService {
           customer_id: intel.customer_id,
           customer_code: intel.customer_code,
           name: intel.name,
+          phone: c.phone || '',
+          whatsapp_bill_consent: c.whatsapp_bill_consent ?? 0,
+          marketing_consent: c.marketing_consent ?? 0,
           category: intel.category,
           customer_segment: intel.customer_segment,
+          tags: intel.tags || [intel.customer_segment],
+          is_credit_customer: intel.is_credit_customer,
+          has_credit_due: intel.has_credit_due,
+          credit_status: intel.credit_status,
           segment_health_summary: intel.segment_health_summary,
           average_visit_interval: intel.average_visit_interval,
           last_purchase_date: intel.last_purchase_date,

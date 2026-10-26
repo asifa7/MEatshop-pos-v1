@@ -26,6 +26,7 @@ import { customerService } from '../modules/customers/backend/service/customer_s
 import { creditService } from '../modules/customers/backend/service/credit_service';
 import { customerIntelligenceService } from '../modules/customers/backend/service/customer_intelligence_service';
 import { customerUpiService } from '../modules/customers/backend/service/customer_upi_service';
+import { customerSeedService } from '../modules/customers/backend/service/customer_seed_service';
 import { arReportsService } from '../modules/customers/backend/service/ar_reports_service';
 import { supplierService } from '../modules/inventory/backend/service/supplier_service';
 import { procurementService } from '../modules/inventory/backend/service/procurement_service';
@@ -45,6 +46,7 @@ import { assetService } from '../modules/inventory/backend/service/asset_service
 import { inventoryLedgerService } from '../modules/inventory/backend/service/inventory_ledger_service';
 import { paymentEngineService } from '../modules/ledger/backend/service/payment_engine_service';
 import { rolePermissionsService } from '../modules/settings/backend/role_permissions_service';
+import { statementReconciliationService } from '../modules/reconciliation/backend/service/statement_reconciliation_service';
 
 
 let mainWindow: BrowserWindow | null = null;
@@ -325,12 +327,15 @@ function registerIpcHandlers() {
     return handleIPCRequest(() => ({
       appVersion: app.getVersion(),
       electronVersion: process.versions.electron,
+      electron: process.versions.electron,
       nodeVersion: process.versions.node,
       chromeVersion: process.versions.chrome,
       platform: process.platform,
       arch: process.arch,
       env: configService.get().env,
+      isPackaged: app.isPackaged,
       dbPath: configService.get().dbPath,
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / (1024 * 1024)),
     }));
   });
 
@@ -387,6 +392,10 @@ function registerIpcHandlers() {
 
   secureIpcHandle(IPC_CHANNELS.BILLING.UPDATE_ITEM_QTY, (_, args) => {
     return handleIPCRequest(() => invoiceService.updateItemQuantity(args.item_id, args.quantity_grams, args.quantity_units));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.BILLING.UPDATE_ITEM_RATE, (_, args) => {
+    return handleIPCRequest(() => invoiceService.updateItemRate(args.item_id, args.rate_paise, args.reason));
   });
 
   secureIpcHandle(IPC_CHANNELS.BILLING.REMOVE_ITEM, (_, args) => {
@@ -693,6 +702,12 @@ function registerIpcHandlers() {
 
   secureIpcHandle(IPC_CHANNELS.BILLING.SEND_WHATSAPP_BILL, async (_, args: { invoice_id: number; customPhone?: string }) => {
     return handleIPCRequest(async () => {
+      if (!args || !args.invoice_id) {
+        return {
+          success: false,
+          failureReason: 'Valid invoice ID is required to send WhatsApp bill',
+        };
+      }
       const res = await whatsAppService.sendInvoiceWhatsApp(args.invoice_id, args.customPhone);
       const allWindows = BrowserWindow.getAllWindows();
       for (const win of allWindows) {
@@ -701,14 +716,14 @@ function registerIpcHandlers() {
             win.webContents.send(IPC_CHANNELS.WHATSAPP.EVENT_SEND_SUCCESS, {
               queueId: args.invoice_id,
               invoiceId: args.invoice_id,
-              phone: res.phone || '',
+              phone: res.phone || args.customPhone || '',
               messageType: 'receipt',
             });
           } else {
             win.webContents.send(IPC_CHANNELS.WHATSAPP.EVENT_SEND_FAILED, {
               queueId: args.invoice_id,
               invoiceId: args.invoice_id,
-              phone: res.phone || '',
+              phone: res.phone || args.customPhone || '',
               reason: res.failureReason || 'Dispatch failed',
             });
           }
@@ -849,6 +864,14 @@ function registerIpcHandlers() {
 
   secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_SUPPLIER_SNAPSHOT, (_, args) => {
     return handleIPCRequest(() => container.procurementService.getSupplierSnapshot(args.supplier_id));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_LAST_PURCHASE_RATE, (_, args) => {
+    return handleIPCRequest(() => container.procurementService.getLastPurchaseRate(args.supplier_id, args.product_variant_id));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.CHECK_DUPLICATE_SUPPLIER_INVOICE, (_, args) => {
+    return handleIPCRequest(() => container.procurementService.checkDuplicateSupplierInvoice(args.supplier_id, args.supplier_invoice_number));
   });
 
   secureIpcHandle(IPC_CHANNELS.INVENTORY.EDIT_PURCHASE, (_, args) => {
@@ -1044,9 +1067,64 @@ function registerIpcHandlers() {
     return handleIPCRequest(() => yieldProcessingService.processLiveChickenBatch(args, authService.getCurrentUserId() || 1));
   });
 
-  secureIpcHandle(IPC_CHANNELS.INVENTORY.LIST_PROCESSING_EVENTS, (_, args?: { limit?: number }) => {
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_LIVE_CHICKEN_YIELD_SETTINGS, () => {
     const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
-    return handleIPCRequest(() => yieldProcessingService.listProcessingEvents(args?.limit));
+    return handleIPCRequest(() => yieldProcessingService.getLiveChickenYieldSettings());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.UPDATE_LIVE_CHICKEN_YIELD_SETTINGS, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.updateLiveChickenYieldSettings(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_LIVE_CHICKEN_POOL_SUMMARY, () => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.getLiveChickenPoolSummary());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.PROCESS_SIMPLE_LIVE_YIELD, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.processSimpleLiveYield(args, authService.getCurrentUserId() || 1));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_ANIMAL_YIELD_CONFIGS, () => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.getAnimalYieldConfigs());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.UPDATE_ANIMAL_YIELD_CONFIG, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.updateAnimalYieldConfig(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.CREATE_ANIMAL_YIELD_CONFIG, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.createAnimalYieldConfig(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_YIELD_RATIOS_FOR_ANIMAL, (_, args: { animal_key: string }) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.getYieldRatiosForAnimal(args?.animal_key || 'chicken'));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.SET_YIELD_RATIO, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.setYieldRatio(args, authService.getCurrentUserId() || 1));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.DELETE_YIELD_RATIO, (_, args: { ratio_id: number }) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.deleteYieldRatio(args?.ratio_id, authService.getCurrentUserId() || 1));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.GET_ANIMAL_POOL_SUMMARY, (_, args: { animal_key?: string }) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.getAnimalPoolSummary(args?.animal_key || 'chicken'));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.INVENTORY.ADJUST_LIVE_STOCK, (_, args: any) => {
+    const { yieldProcessingService } = require('../modules/inventory/backend/service/yield_processing_service');
+    return handleIPCRequest(() => yieldProcessingService.adjustLiveStock(args, authService.getCurrentUserId() || 1));
   });
 
   // ─── Physical Audit & Consistency Checker Handlers ───
@@ -1260,8 +1338,12 @@ function registerIpcHandlers() {
     return handleIPCRequest(() => productManagementService.updateVariantYield(args.variant_id, args.parent_variant_id, args.yield_ratio));
   });
 
-  secureIpcHandle(IPC_CHANNELS.PRODUCTS.UPDATE_TRACKING_MODE, (_, args: { id: number; trackInInventory: boolean; reason: string }) => {
-    return handleIPCRequest(() => productManagementService.updateProductTracking(args.id, args.trackInInventory, args.reason, authService.getCurrentUserId() || 1));
+  secureIpcHandle(IPC_CHANNELS.PRODUCTS.UPDATE_TRACKING_MODE, (_, args: { id: number; trackInInventory: boolean; reason?: string }) => {
+    return handleIPCRequest(() => productManagementService.updateProductTracking(args.id, args.trackInInventory, args.reason || '', authService.getCurrentUserId() || 1));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.PRODUCTS.BULK_UPDATE_TRACKING_MODE, (_, args: { ids: number[]; trackInInventory: boolean; reason?: string }) => {
+    return handleIPCRequest(() => productManagementService.bulkUpdateProductTracking(args.ids, args.trackInInventory, args.reason || '', authService.getCurrentUserId() || 1));
   });
 
   secureIpcHandle(IPC_CHANNELS.PRODUCTS.GET_TRACKING_HISTORY, (_, args: { productId: number }) => {
@@ -1327,10 +1409,16 @@ function registerIpcHandlers() {
     });
   });
 
+  secureIpcHandle(IPC_CHANNELS.SYSTEM.RESTORE_EMERGENCY_BACKUP, () => {
+    return handleIPCRequest(() => backupService.restoreLatestEmergencyBackup());
+  });
+
   // ─── Customer A/R Handlers ───
 
   secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_ALL, (_, args) => {
-    return handleIPCRequest(() => customerService.getAllCustomers(args?.includeInactive ?? false));
+    return handleIPCRequest(() => customerService.getAllCustomers(args?.includeInactive ?? false, {
+      includeTest: args?.includeTest ?? customerIntelligenceService.getIncludeTestData(),
+    }));
   });
 
   secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_BY_ID, (_, args) => {
@@ -1381,12 +1469,40 @@ function registerIpcHandlers() {
     return handleIPCRequest(() => customerService.getCustomerUnifiedTimeline(args.customer_id, args.limit));
   });
 
-  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_CRM_ALERTS, () => {
-    return handleIPCRequest(() => customerIntelligenceService.getShopCrmAlertsSummary());
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_CRM_ALERTS, (_, args) => {
+    return handleIPCRequest(() => customerIntelligenceService.getShopCrmAlertsSummary(args?.include_test));
   });
 
   secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_NEEDING_ATTENTION, (_, args) => {
     return handleIPCRequest(() => customerIntelligenceService.getCustomersNeedingAttention(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GENERATE_SEED_DATA, () => {
+    return handleIPCRequest(() => customerSeedService.generatePhase3SeedData());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.CLEAR_SEED_DATA, () => {
+    return handleIPCRequest(() => customerSeedService.clearTestSeedData());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.SET_INCLUDE_TEST_DATA, (_, args) => {
+    return handleIPCRequest(() => {
+      customerIntelligenceService.setIncludeTestData(!!args.include_test);
+      return { include_test: customerIntelligenceService.getIncludeTestData() };
+    });
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_INCLUDE_TEST_DATA, () => {
+    return handleIPCRequest(() => {
+      return { include_test: customerIntelligenceService.getIncludeTestData() };
+    });
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.UPDATE_CONSENT, (_, args) => {
+    return handleIPCRequest(() => customerService.updateConsent(args.customer_id, {
+      whatsapp_bill_consent: args.whatsapp_bill_consent,
+      marketing_consent: args.marketing_consent,
+    }));
   });
 
   secureIpcHandle(IPC_CHANNELS.CUSTOMERS.MATCH_UPI, (_, args) => {
@@ -1406,7 +1522,141 @@ function registerIpcHandlers() {
   });
 
   secureIpcHandle(IPC_CHANNELS.CUSTOMERS.MERGE, (_, args) => {
-    return handleIPCRequest(() => customerService.mergeCustomers(args.source_customer_id, args.target_customer_id, { reason: args.reason }));
+    return handleIPCRequest(() => customerService.mergeCustomers(args.source_customer_id, args.target_customer_id, {
+      reason: args.reason,
+      chosenCreditLimitPaise: args.chosen_credit_limit_paise,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_DRIFT_REPORT, () => {
+    return handleIPCRequest(() => customerService.getDriftReport());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.RECOMPUTE_BALANCES, (_, args) => {
+    return handleIPCRequest(() => customerService.recomputeBalancesFromLedger(args?.customer_id));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.FAST_LOOKUP, (_, args) => {
+    return handleIPCRequest(() => customerService.fastCustomerLookup(args.query, args.limit));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.QUICK_ADD, (_, args) => {
+    return handleIPCRequest(() => customerService.quickAddCustomer(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_REGULARS, (_, args) => {
+    return handleIPCRequest(() => customerService.getRegulars(args?.limit, args?.segment_filter, args?.time_slot_filter));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_TIER_SETTINGS, () => {
+    return handleIPCRequest(() => customerService.getTierSettings());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.UPDATE_TIER_SETTINGS, (_, args) => {
+    return handleIPCRequest(() => customerService.updateTierSettings(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.RECALCULATE_TIERS, () => {
+    return handleIPCRequest(() => customerService.recalculateCustomerTiers());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.SET_MANUAL_TIER, (_, args) => {
+    return handleIPCRequest(() => customerService.setManualCustomerTier(args.customer_id, args.tier, args.preferred_time_slot));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_RECENTS, (_, args) => {
+    return handleIPCRequest(() => customerService.getRecentCustomers(args?.limit));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.GET_REPEAT_ORDER, (_, args) => {
+    return handleIPCRequest(() => customerService.getRepeatOrder(args.customer_id));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.CUSTOMERS.RECORD_WHATSAPP_ATTEMPT, (_, args) => {
+    return handleIPCRequest(async () => {
+      let waUrl = '';
+      try {
+        const text = whatsAppService.generateInvoiceWhatsAppText(args.invoice_id);
+        waUrl = whatsAppService.generateWhatsAppUrl(args.phone, text);
+        if (args.open_link !== false && waUrl) {
+          shell.openExternal(waUrl).catch((err) => {
+            logger.warn('Failed to open wa.me URL via shell', { error: err });
+          });
+        }
+      } catch (err: any) {
+        logger.warn('Failed to generate wa.me link for invoice', { error: err });
+      }
+      const record = customerService.recordWhatsAppAttempt(args);
+      return {
+        ...record,
+        wa_url: waUrl,
+      };
+    });
+  });
+
+  // ─── Bank Statement Reconciliation Handlers (Phase 3B) ───
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.GET_PROFILES, () => {
+    return handleIPCRequest(() => statementReconciliationService.getProfiles());
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.SAVE_PROFILE, (_, args: any) => {
+    return handleIPCRequest(() => statementReconciliationService.saveProfile(args));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.PARSE_CSV_PREVIEW, (_, args: { csvContent: string }) => {
+    return handleIPCRequest(() => statementReconciliationService.parseCsv(args.csvContent));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.INGEST_STATEMENT, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.ingestStatement({
+      ...args,
+      userId: session?.userId,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.RUN_MATCHING, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.runReconciliation({
+      ...args,
+      userId: session?.userId,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.MANUAL_MATCH, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.manualMatch({
+      ...args,
+      userId: session?.userId,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.MARK_NOT_A_SALE, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.markNotASale({
+      ...args,
+      userId: session?.userId,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.LINK_PAYER_ALIAS, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.linkPayerAlias({
+      ...args,
+      userId: session?.userId,
+    }));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.GET_SHIFT_SUMMARY, (_, args: { shiftDate: string; importId?: number }) => {
+    return handleIPCRequest(() => statementReconciliationService.getShiftReconciliationSummary(args.shiftDate, args.importId));
+  });
+
+  secureIpcHandle(IPC_CHANNELS.RECONCILIATION.SYNC_GATEWAY, (_, args: any) => {
+    const session = authService.getSession();
+    return handleIPCRequest(() => statementReconciliationService.syncGatewaySettlements({
+      ...args,
+      userId: session?.userId,
+    }));
   });
 
   // Credit Account
@@ -1783,18 +2033,28 @@ function registerIpcHandlers() {
   secureIpcHandle(IPC_CHANNELS.CASHBOX.GET_SHIFT_DETAILS, (_, args) => handleIPCRequest(() => cashBoxService.getShiftDetails(args.sessionId)));
   secureIpcHandle(IPC_CHANNELS.CASHBOX.APPLY_CORRECTION, (_, args) => handleIPCRequest(() => cashBoxService.applyShiftCorrection(args)));
   secureIpcHandle(IPC_CHANNELS.CASHBOX.GET_SHIFT_TRANSACTIONS, (_, args) => handleIPCRequest(() => cashBoxService.getShiftTransactions(args.sessionId)));
+  secureIpcHandle(IPC_CHANNELS.CASHBOX.GET_PAYMENT_METHODS, (_, args) => handleIPCRequest(() => cashBoxService.getPaymentMethods(args?.includeDisabled ?? true)));
+  secureIpcHandle(IPC_CHANNELS.CASHBOX.SAVE_PAYMENT_METHOD, (_, args) => handleIPCRequest(() => cashBoxService.savePaymentMethod(args)));
 
   // ─── Expense Manager ─────────────────────────────────────────────────────────
   secureIpcHandle(IPC_CHANNELS.EXPENSES.GET_CATEGORIES, () => handleIPCRequest(() => expenseService.getCategories()));
   secureIpcHandle(IPC_CHANNELS.EXPENSES.CREATE_CATEGORY, (_, args) => handleIPCRequest(() => expenseService.createCategory(args.name)));
   secureIpcHandle(IPC_CHANNELS.EXPENSES.RECORD_EXPENSE, (_, args) => handleIPCRequest(() => expenseService.recordExpense(args)));
   secureIpcHandle(IPC_CHANNELS.EXPENSES.GET_EXPENSES, () => handleIPCRequest(() => expenseService.getExpenses()));
+  secureIpcHandle(IPC_CHANNELS.EXPENSES.GET_TODAY, () => handleIPCRequest(() => expenseService.getTodayExpenses()));
+  secureIpcHandle(IPC_CHANNELS.EXPENSES.GET_MONTHLY_TOTALS, () => handleIPCRequest(() => expenseService.getMonthlyCategoryTotals()));
 
   // ─── Daily Market Prices ──────────────────────────────────────────────────────
   secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.SET_CHICKEN_PRICE, (_, args) => handleIPCRequest(() => marketPriceService.setChickenPrice(args)));
   secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.GET_CHICKEN_PRICES, () => handleIPCRequest(() => marketPriceService.getChickenPrices()));
   secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.SET_EGG_PRICE, (_, args) => handleIPCRequest(() => marketPriceService.setEggPrice(args)));
   secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.GET_EGG_PRICES, () => handleIPCRequest(() => marketPriceService.getEggPrices()));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.GET_SOURCES, () => handleIPCRequest(() => marketPriceService.getPriceSources()));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.SAVE_SOURCE, (_, args) => handleIPCRequest(() => marketPriceService.savePriceSource(args)));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.DELETE_SOURCE, (_, args) => handleIPCRequest(() => marketPriceService.deletePriceSource(args.id)));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.FETCH_NOW, (_, args) => handleIPCRequest(() => marketPriceService.fetchNow(args?.sourceId)));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.APPLY_SUGGESTION, (_, args) => handleIPCRequest(() => marketPriceService.applySuggestedPrice(args.sourceId, args?.ratePaise)));
+  secureIpcHandle(IPC_CHANNELS.MARKET_PRICES.GET_FETCH_LOGS, (_, args) => handleIPCRequest(() => marketPriceService.getFetchLogs(args?.limit)));
 
   // ─── Ledgers & Audit Logs ────────────────────────────────────────────────────
   secureIpcHandle(IPC_CHANNELS.LEDGERS.GET_ENTRIES, (_, args) => handleIPCRequest(() => ledgerService.getAccountingEntries(args?.accountType)));
@@ -1832,6 +2092,12 @@ function registerIpcHandlers() {
   secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.REVERSE, (_, args) => handleIPCRequest(() => paymentEngineService.reversePayment(args.payment_receipt_id, args.reason, authService.getCurrentUserId() || 1)));
   secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_BILL_PAYMENT_HISTORY, (_, args) => handleIPCRequest(() => paymentEngineService.getBillPaymentHistory(args.billType, args.billId)));
   secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_OUTSTANDING_BILLS, (_, args) => handleIPCRequest(() => paymentEngineService.getOutstandingPurchaseBills(args || {})));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_VENDOR_PAYABLES, (_, args) => handleIPCRequest(() => paymentEngineService.getVendorPayablesSummary(args || {})));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.RECORD_VENDOR_PAYMENT, (_, args) => handleIPCRequest(() => paymentEngineService.recordVendorPayment(args, authService.getCurrentUserId() || 1)));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_VENDOR_OUTSTANDING, (_, args) => handleIPCRequest(() => paymentEngineService.getVendorOutstanding(args.supplierId)));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.CHECK_HEALTH, (_, args) => handleIPCRequest(() => paymentEngineService.checkPayablesHealth(args || {})));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_CREDIT_DAYS, () => handleIPCRequest(() => paymentEngineService.getSupplierCreditDays()));
+  secureIpcHandle(IPC_CHANNELS.PAYMENTS_RECEIPTS.UPDATE_CREDIT_DAYS, (_, args) => handleIPCRequest(() => paymentEngineService.updateSupplierCreditDays(args.days)));
 
   secureIpcHandle(IPC_CHANNELS.DELIVERY.CREATE, (_, args) => {
     console.log('[MAIN-IPC-DELIVERY-CREATE]', 'Handler entered. Args received:', JSON.stringify(args));

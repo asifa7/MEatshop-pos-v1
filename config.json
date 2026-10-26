@@ -1,8 +1,8 @@
 {
   "env": "development",
-  "dbPath": "dev.db",
+  "dbPath": "D:\\pos\\antigravity v10\\aistudio-pos\\dev.db",
   "shopInfo": {
-    "name": "My Premium Meat Shop",
+    "name": "IShanth protiens",
     "address": "123 Market Square, Bangalore",
     "phone": "+91 98765 43210",
     "gstin": "29AAAAA0000A1Z5",
@@ -19,7 +19,8 @@
     "prefix": "INV-",
     "startingNumber": 1,
     "termsAndConditions": "Goods once sold cannot be returned without receipt.",
-    "copiesCount": 1
+    "copiesCount": 1,
+    "editDeletePasswordHash": ""
   },
   "tax": {
     "gstEnabled": true,
@@ -43,7 +44,10 @@
     ],
     "defaultPaymentMethod": "cash",
     "allowSplit": true,
-    "allowCredit": true
+    "allowCredit": true,
+    "upiId": "",
+    "upiPayeeName": "",
+    "printUpiQrOnDelivery": true
   },
   "cashbox": {
     "enableShifts": true,
@@ -91,7 +95,7 @@
   },
   "theme": "dark",
   "hardware": {
-    "printerName": "",
+    "printerName": "RP 3220 Star",
     "scalePort": "",
     "scaleBaudRate": 9600,
     "barcodeScannerEnabled": true,
@@ -108,20 +112,175 @@
     "showDiscount": true,
     "showCashier": true,
     "showCustomer": true,
-    "leftMarginMm": 0,
+    "leftMarginMm": 5,
+    "rightMarginMm": 4,
+    "rightSafeMarginMm": 5,
     "safePrintWidthMm": 60,
     "topMarginMm": 0,
     "fontFamily": "Consolas",
-    "fontSize": "medium",
-    "headerAlignment": "center"
+    "fontSize": "large",
+    "headerAlignment": "center",
+    "itemWidthPercent": 40,
+    "qtyWidthPercent": 20,
+    "rateWidthPercent": 20,
+    "amountWidthPercent": 20,
+    "billPrintClosingBalance": true,
+    "cardBillDouble": false,
+    "subBillPrint": false,
+    "cashDrawerOpen": false,
+    "tamilFont": false,
+    "splitAmount": false,
+    "cashTender": false,
+    "customerCredit": false,
+    "crmPoints": false,
+    "dosPrinter": true,
+    "discountEveryLine": false,
+    "noOfBillPrint": 1,
+    "secondBillDelayMs": 100,
+    "duplicateCopyLabel": "Duplicate Copy",
+    "topSlogan": "",
+    "shopName": "",
+    "addressLine1": "123 Market Square, Bangalore",
+    "addressLine2": "",
+    "city": "",
+    "pinCode": "",
+    "phone": "",
+    "gstin": "",
+    "email": "",
+    "condition1": "",
+    "condition2": "",
+    "condition3": "",
+    "footerCondition1": "",
+    "footerCondition2": "",
+    "footerCondition3": "",
+    "footerMsg1": "",
+    "footerMsg2": "",
+    "unprintableRightZoneMm": 20,
+    "itemColLabel": "ITEM",
+    "qtyColLabel": "Qty",
+    "rateColLabel": "Rate",
+    "amtColLabel": "Amount",
+    "elementOffsets": {},
+    "upiId": "",
+    "upiPayeeName": "",
+    "printUpiQrOnDelivery": true,
+    "softwareMobileNo": "7200134807",
+    "whatsAppSendMode": "direct",
+    "whatsAppMetaApiKey": "",
+    "whatsAppMetaPhoneId": "",
+    "whatsAppWabaId": "",
+    "whatsAppDefaultMessage": "Thank you for shopping with us! Visit again. Quality is our promise.",
+    "whatsAppAutoFestivalWishes": true,
+    "festivalGreetings": [
+      {
+        "id": "pongal",
+        "name": "Pongal / Makar Sankranti",
+        "date": "01-14",
+        "greeting": "🌾 Wishing you and your family a very Happy & Prosperous Pongal! 🌞",
+        "enabled": true
+      },
+      {
+        "id": "republic_day",
+        "name": "Republic Day",
+        "date": "01-26",
+        "greeting": "🇮🇳 Happy Republic Day! Let us celebrate the glory of our Nation.",
+        "enabled": true
+      },
+      {
+        "id": "ramadan_eid",
+        "name": "Eid-ul-Fitr / Ramzan",
+        "date": "03-31",
+        "greeting": "🌙 Eid Mubarak! Wishing you peace, joy and prosperity.",
+        "enabled": true
+      },
+      {
+        "id": "tamil_new_year",
+        "name": "Tamil New Year / Puthandu",
+        "date": "04-14",
+        "greeting": "✨ Iniya Tamizh Puthandu Nalvazhthukkal! Have a blissful year.",
+        "enabled": true
+      },
+      {
+        "id": "bakrid",
+        "name": "Bakrid / Eid-ul-Adha",
+        "date": "06-07",
+        "greeting": "🌙 Bakrid Mubarak! May this day bring peace and happiness.",
+        "enabled": true
+      },
+      {
+        "id": "independence_day",
+        "name": "Independence Day",
+        "date": "08-15",
+        "greeting": "🇮🇳 Happy Independence Day! Proud to serve you.",
+        "enabled": true
+      },
+      {
+        "id": "ganesh_chaturthi",
+        "name": "Ganesh Chaturthi",
+        "date": "08-27",
+        "greeting": "🌺 Happy Ganesh Chaturthi! May Lord Ganesha shower you with blessings.",
+        "enabled": true
+      },
+      {
+        "id": "onam",
+        "name": "Onam",
+        "date": "09-05",
+        "greeting": "🌸 Happy Onam! Wishing you joy, good health and prosperity.",
+        "enabled": true
+      },
+      {
+        "id": "ayudha_poojai",
+        "name": "Ayudha Poojai / Saraswathi Poojai",
+        "date": "10-19",
+        "greeting": "✨ Happy Ayudha Poojai & Saraswathi Poojai! Best wishes for success and growth.",
+        "enabled": true
+      },
+      {
+        "id": "vijayadashami",
+        "name": "Vijayadashami / Dussehra",
+        "date": "10-20",
+        "greeting": "🏹 Happy Vijayadashami! May victory and goodness prevail.",
+        "enabled": true
+      },
+      {
+        "id": "deepavali",
+        "name": "Diwali / Deepavali",
+        "date": "11-08",
+        "greeting": "🪔 Wishing you and your family a glittering and Happy Deepavali! 🎆",
+        "enabled": true
+      },
+      {
+        "id": "christmas",
+        "name": "Christmas",
+        "date": "12-25",
+        "greeting": "🎄 Merry Christmas! Wishing you joy, warmth and festive cheer.",
+        "enabled": true
+      },
+      {
+        "id": "new_year",
+        "name": "New Year",
+        "date": "01-01",
+        "greeting": "🎉 Happy New Year! Wishing you a healthy and prosperous year ahead.",
+        "enabled": true
+      }
+    ]
   },
   "billingSettings": {
     "skipPaymentConfirmation": false,
     "enableCalculatorWidget": true,
     "defaultPaymentMethod": "cash"
   },
+  "meatYield": {
+    "defaultChickenYieldRatio": 1.6,
+    "yieldEnabled": true,
+    "trackLiverGizzard": true,
+    "wholeChickenGrams": 625,
+    "liverGrams": 30,
+    "gizzardGrams": 40,
+    "customProductRatios": {}
+  },
   "backup": {
-    "backupDir": "E:\\pos\\claude version1\\aug17Aistuiv2\\backups",
+    "backupDir": "C:\\Users\\asif\\AppData\\Roaming\\meat-shop-pos\\backups",
     "autoBackupOnClose": true,
     "maxBackupsToKeep": 7
   },
@@ -141,7 +300,7 @@
   "whatsAppConfig": {
     "maxRetries": 3,
     "retryBackoffSeconds": 30,
-    "billCaptionTemplate": "🧾 *{shopName}*\nDear *{customerName}*, greetings from {shopName}! 🙏\n\n📄 *Bill No:* {billNo}\n💰 *Bill Total:* ₹{netAmount}\n📅 *Date:* {date}\n\nAttached is your digital bill receipt. Thank you for choosing us! ✨",
+    "billCaptionTemplate": "🧾 *{shopName}*\nDear *{customerName}*, greetings from {shopName}! 🙏\nOut Previous Balance is *{previousBalance}\n\n💰 *Bill Total:* ₹{netAmount}\nAttached is your digital bill receipt. Thank you for choosing us! ✨ {paymentMode}",
     "deliveryMessageTemplate": "🛵 *Order Confirmed - Will deliver shortly!*\nDear *{customerName}*, your order (#{billNo}) is freshly prepared and out for delivery shortly. Thank you! 🙏"
   }
 }

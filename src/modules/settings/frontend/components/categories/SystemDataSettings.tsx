@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Database, Download, CheckCircle2, FileSpreadsheet } from 'lucide-react';
+import { Database, Download, CheckCircle2, FileSpreadsheet, ShieldAlert } from 'lucide-react';
 import { SettingCard } from '../ui/SettingCard';
 import { SettingRow } from '../ui/SettingRow';
 import { SwitchControl } from '../ui/SwitchControl';
@@ -14,6 +14,26 @@ export const SystemDataSettings: React.FC = () => {
   const [restoreMsg, setRestoreMsg] = useState<string | null>(null);
   const [exportMsg, setExportMsg] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleEmergencyRecovery = async () => {
+    const confirmed = window.confirm("EMERGENCY RECOVERY: This will immediately restore the database from the latest automatic shutdown snapshot in db_backups/. Continue?");
+    if (!confirmed) return;
+
+    setIsProcessing(true);
+    setRestoreMsg(null);
+    try {
+      const res = await window.api.invoke('system:restore-emergency-backup');
+      if (res.success) {
+        setRestoreMsg(`Emergency Recovery Successful: Restored from ${res.backupFile} (Integrity: ${res.integrity || 'ok'}).`);
+      } else {
+        setRestoreMsg(`Emergency recovery failed: ${res.error?.message || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setRestoreMsg(`Emergency recovery failed: ${err.message}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
 
   const handleRestoreDatabase = async () => {
     const confirmed = window.confirm("This will overwrite all current data. Continue?");
@@ -136,6 +156,21 @@ export const SystemDataSettings: React.FC = () => {
             <span>{backupMsg}</span>
           </div>
         )}
+
+        <SettingRow
+          label="Emergency 1-Click Database Recovery"
+          description="Instantly restore the database from the latest automatic exit snapshot in db_backups/"
+        >
+          <button
+            type="button"
+            disabled={isProcessing}
+            onClick={handleEmergencyRecovery}
+            className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+          >
+            <ShieldAlert size={13} />
+            <span>{isProcessing ? 'Recovering...' : '1-Click Emergency Recovery'}</span>
+          </button>
+        </SettingRow>
 
         <SettingRow
           label="Restore Database Snapshot"

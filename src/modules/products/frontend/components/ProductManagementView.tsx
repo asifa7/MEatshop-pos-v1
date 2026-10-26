@@ -1,16 +1,17 @@
 import { useState, useMemo } from 'react';
 import {
-  Plus, Package, Power, PowerOff, Edit2, Clock, AlertCircle,
+  Plus, Package, Power, PowerOff, Edit2, Clock, AlertCircle, AlertTriangle,
   RefreshCw, Search, FileSpreadsheet, Trash2, Eye, EyeOff, Filter,
-  Archive
+  Archive, CheckCircle2
 } from 'lucide-react';
 import { useAdminProducts, useProductRateHistory } from '../hooks/useProducts';
 import { useSession } from '../../../auth/frontend/hooks/useAuth';
 import {
   useDeactivateProduct, useReactivateProduct, useDeleteProduct,
   useDeactivateCategory, useReactivateCategory, useDeleteCategory,
+  useUpdateProductTracking, useBulkUpdateProductTracking,
 } from '../hooks/useProductMutations';
-import { formatPaise } from '../../../billing/frontend/types/billing.types';
+import { formatMoney } from '../../../../core/shared/math';
 import { FIXED_CATEGORIES } from '../../types/products.types';
 import type { AdminProduct } from '../../types/products.types';
 import ProductForm from './ProductForm';
@@ -18,6 +19,13 @@ import RateHistoryPanel from './RateHistoryPanel';
 import DeactivateConfirmDialog, { DeactivateTarget } from './DeactivateConfirmDialog';
 import BulkProductSheetModal from './BulkProductSheetModal';
 import DeletedProductsModal from './DeletedProductsModal';
+
+function getStandardUnitLabel(product: AdminProduct): 'kg' | 'pcs' | 'tray' {
+  const nameLower = (product.name || '').toLowerCase();
+  if (nameLower.includes('tray')) return 'tray';
+  if (product.unit_type === 'piece') return 'pcs';
+  return 'kg';
+}
 
 // ─── Rate History Modal Wrapper ────────────────────────────────────────────────
 function RateHistoryWrapper({ product, onClose }: { product: AdminProduct; onClose: () => void }) {
@@ -50,6 +58,8 @@ export default function ProductManagementView() {
   const deactivateCategory = useDeactivateCategory();
   const reactivateCategory = useReactivateCategory();
   const deleteCategory = useDeleteCategory();
+  const updateTracking = useUpdateProductTracking();
+  const bulkUpdateTracking = useBulkUpdateProductTracking();
 
   // Search & Filter State
   const [searchTerm, setSearchTerm] = useState('');
@@ -108,6 +118,71 @@ export default function ProductManagementView() {
       return matchesActive && matchesCategory && matchesSearch;
     });
   }, [products, showInactive, selectedCategory, searchTerm]);
+
+  // Multi-Selection State
+  const [selectedProductIds, setSelectedProductIds] = useState<Set<number>>(new Set());
+
+  const isAllSelected = filteredProducts.length > 0 && filteredProducts.every(p => selectedProductIds.has(p.id));
+  const isSomeSelected = filteredProducts.some(p => selectedProductIds.has(p.id)) && !isAllSelected;
+
+  const handleSelectAll = () => {
+    if (isAllSelected) {
+      setSelectedProductIds(new Set());
+    } else {
+      setSelectedProductIds(new Set(filteredProducts.map(p => p.id)));
+    }
+  };
+
+  const handleToggleSelect = (id: number) => {
+    setSelectedProductIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const handleBulkTrackingToggle = async (enable: boolean) => {
+    const ids = Array.from(selectedProductIds);
+    if (ids.length === 0) return;
+    try {
+      await bulkUpdateTracking.mutateAsync({
+        ids,
+        trackInInventory: enable,
+        reason: enable ? 'Bulk tracking enabled' : 'Bulk tracking disabled (derived cuts)',
+      });
+      setSelectedProductIds(new Set());
+    } catch (err) {
+      console.warn('Bulk IPC failed, falling back to individual updates:', err);
+      try {
+        for (const id of ids) {
+          await updateTracking.mutateAsync({
+            id,
+            trackInInventory: enable,
+            reason: enable ? 'Tracking enabled' : 'Tracking disabled',
+          });
+        }
+        setSelectedProductIds(new Set());
+      } catch (innerErr) {
+        console.error('Individual update also failed:', innerErr);
+      }
+    }
+  };
+
+  const handleSingleTrackingToggle = async (product: AdminProduct) => {
+    const isCurrentlyTracked = product.track_in_inventory !== undefined && product.track_in_inventory !== null 
+      ? product.track_in_inventory === 1 
+      : (product.is_processed_cut === 0);
+    const nextState = !isCurrentlyTracked;
+    await updateTracking.mutateAsync({
+      id: product.id,
+      trackInInventory: nextState,
+      reason: nextState ? 'Tracking enabled' : 'Tracking disabled (derived cut)',
+    });
+  };
 
   const totalProducts = products.length;
   const activeProductsCount = products.filter(p => p.is_active === 1).length;
@@ -320,6 +395,70 @@ export default function ProductManagementView() {
         </div>
       )}
 
+      {/* Bulk Action Bar for Selected Products */}
+      {selectedProductIds.size > 0 && (
+        <div className="px-6 py-2.5 bg-brand-500/15 border-b border-brand-500/30 flex flex-wrap items-center justify-between gap-3 flex-shrink-0 animate-in fade-in slide-in-from-top-1 duration-150">
+          <div className="flex items-center gap-3">
+            <span className="px-2.5 py-1 rounded-xl bg-brand-500 text-white font-extrabold text-xs shadow-sm">
+              {selectedProductIds.size} Selected
+            </span>
+            <span className="text-xs text-text-primary font-semibold">
+              Track Inventory:
+            </span>
+            <span className="text-[11px] text-text-muted hidden md:inline">
+              (Turn OFF for derived cuts like chicken boneless/bone so stock attention won't alert)
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleBulkTrackingToggle(true)}
+              disabled={bulkUpdateTracking.isPending}
+              className="px-3.5 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-600 text-white text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50"
+              title="Turn ON inventory tracking for all selected products"
+            >
+              <CheckCircle2 size={14} />
+              <span>Turn Tracking ON</span>
+            </button>
+
+            <button
+              onClick={() => handleBulkTrackingToggle(false)}
+              disabled={bulkUpdateTracking.isPending}
+              className="px-3.5 py-1.5 rounded-xl bg-surface-card hover:bg-surface-hover border border-border-subtle hover:border-amber-500/40 text-text-primary hover:text-amber-400 text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50"
+              title="Turn OFF inventory tracking for all selected products (no stock attention alerts)"
+            >
+              <EyeOff size={14} />
+              <span>Turn Tracking OFF</span>
+            </button>
+
+            {selectedProductIds.size === 1 && (
+              <button
+                onClick={() => {
+                  const singleId = Array.from(selectedProductIds)[0];
+                  const prod = products.find(p => p.id === singleId);
+                  if (prod) {
+                    setEditProduct(prod);
+                    setShowProductForm(true);
+                  }
+                }}
+                className="px-3.5 py-1.5 rounded-xl bg-brand-500/20 hover:bg-brand-500 text-brand-400 hover:text-white border border-brand-500/40 text-xs font-bold transition-all flex items-center gap-1.5 active:scale-95"
+                title="Edit the selected product"
+              >
+                <Edit2 size={13} />
+                <span>Edit Product</span>
+              </button>
+            )}
+
+            <button
+              onClick={() => setSelectedProductIds(new Set())}
+              className="px-3 py-1.5 rounded-xl hover:bg-surface-card text-text-muted hover:text-text-primary text-xs font-semibold transition-all ml-1"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Flat Product Table View */}
       <div className="flex-1 overflow-y-auto p-6">
         {filteredProducts.length === 0 ? (
@@ -345,6 +484,18 @@ export default function ProductManagementView() {
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-surface-card/70 border-b border-border-subtle text-[10px] uppercase font-extrabold text-text-muted tracking-wider">
+                  <th className="px-3 py-3.5 text-center w-10">
+                    <input
+                      type="checkbox"
+                      checked={isAllSelected}
+                      ref={el => {
+                        if (el) el.indeterminate = isSomeSelected;
+                      }}
+                      onChange={handleSelectAll}
+                      className="w-4 h-4 rounded border-border-subtle text-brand-500 focus:ring-brand-500 cursor-pointer accent-brand-500"
+                      title={isAllSelected ? "Deselect all" : "Select all"}
+                    />
+                  </th>
                   <th className="px-5 py-3.5">Product Name</th>
                   <th className="px-4 py-3.5">Bill No. / Code</th>
                   <th className="px-4 py-3.5">Category</th>
@@ -361,25 +512,46 @@ export default function ProductManagementView() {
               <tbody className="divide-y divide-border-subtle/50 text-xs">
                 {filteredProducts.map(product => {
                   const isActive = product.is_active === 1;
+                  const isSelected = selectedProductIds.has(product.id);
                   const currentCostPaise = product.cost_price_paise_per_unit || product.buying_rate_paise || product.last_purchase_cost_paise || product.variants?.[0]?.cost_price_paise_per_unit || 0;
                   const currentRatePaise = product.current_rate_paise_per_unit || product.variants?.[0]?.current_rate_paise_per_unit || 0;
-                  const isTracked = product.track_in_inventory === 1 || product.is_processed_cut === 0;
+                  const isLowOrZeroMargin = currentCostPaise > 0 && currentRatePaise > 0 && currentRatePaise <= currentCostPaise;
+                  const unitLabel = getStandardUnitLabel(product);
+                  const isTracked = product.track_in_inventory !== undefined && product.track_in_inventory !== null
+                    ? product.track_in_inventory === 1
+                    : (product.is_processed_cut === 0);
                   const categoryBadgeStyle = CATEGORY_COLORS[product.category] || 'text-text-muted bg-surface-card border-border-subtle';
                   const rateChangeCount = (product.rateHistory?.length || product.variants?.[0]?.rateHistory?.length || 1);
 
                   return (
                     <tr
                       key={product.id}
-                      className={`hover:bg-surface-card/40 transition-colors ${!isActive ? 'opacity-50 bg-surface-app/40' : ''}`}
+                      className={`hover:bg-surface-card/40 transition-colors ${isSelected ? 'bg-brand-500/10' : isLowOrZeroMargin ? 'bg-amber-500/5' : ''} ${!isActive ? 'opacity-50 bg-surface-app/40' : ''}`}
                     >
-                      {/* Product Name */}
+                      {/* Selection Checkbox */}
+                      <td className="px-3 py-3.5 text-center">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => handleToggleSelect(product.id)}
+                          className="w-4 h-4 rounded border-border-subtle text-brand-500 focus:ring-brand-500 cursor-pointer accent-brand-500"
+                        />
+                      </td>
+
+                      {/* Product Name + Low/Zero Margin Warning Badge */}
                       <td className="px-5 py-3.5 font-bold text-text-primary">
-                        <div className="flex items-center gap-2.5">
+                        <div className="flex flex-wrap items-center gap-2">
                           <div className={`w-2 h-2 rounded-full shrink-0 ${isActive ? 'bg-brand-500 shadow-sm shadow-brand-500/50' : 'bg-text-muted'}`} />
                           <span className="font-extrabold text-sm text-text-primary">{product.name}</span>
                           {product.hasInvoiceHistory && (
                             <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/30 text-blue-400">
                               Invoiced
+                            </span>
+                          )}
+                          {isLowOrZeroMargin && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                              <AlertTriangle size={11} />
+                              <span>⚠️ Low/Zero Margin: Sell ≤ Buy</span>
                             </span>
                           )}
                         </div>
@@ -409,10 +581,10 @@ export default function ProductManagementView() {
                         </span>
                       </td>
 
-                      {/* Unit Type */}
+                      {/* Standardised Unit Type (kg, pcs, tray) */}
                       <td className="px-4 py-3.5 font-medium text-text-secondary">
-                        <span className="text-xs">
-                          {product.unit_type === 'weight' ? '⚖ Weight (kg)' : product.unit_type === 'piece' ? '🔢 Piece / Unit' : product.unit_type === 'live_dual' ? '🐔 Live Dual' : product.unit_type}
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-md bg-surface-card border border-border-subtle font-mono text-xs font-bold text-text-primary">
+                          {unitLabel}
                         </span>
                       </td>
 
@@ -420,9 +592,9 @@ export default function ProductManagementView() {
                       <td className="px-4 py-3.5 text-right font-mono font-bold text-xs text-text-secondary">
                         {currentCostPaise > 0 ? (
                           <>
-                            {formatPaise(currentCostPaise)}
+                            {formatMoney(currentCostPaise)}
                             <span className="text-[9.5px] text-text-muted font-normal ml-0.5">
-                              /{product.unit_type === 'weight' ? 'kg' : 'unit'}
+                              /{unitLabel}
                             </span>
                           </>
                         ) : (
@@ -431,24 +603,29 @@ export default function ProductManagementView() {
                       </td>
 
                       {/* Selling Rate */}
-                      <td className="px-4 py-3.5 text-right font-mono font-extrabold text-sm text-brand-500">
-                        {formatPaise(currentRatePaise)}
+                      <td className={`px-4 py-3.5 text-right font-mono font-extrabold text-sm ${isLowOrZeroMargin ? 'text-amber-400' : 'text-brand-500'}`}>
+                        {formatMoney(currentRatePaise)}
                         <span className="text-[10px] text-text-muted font-normal ml-1">
-                          /{product.unit_type === 'weight' ? 'kg' : 'unit'}
+                          /{unitLabel}
                         </span>
                       </td>
 
-                      {/* Inventory Tracking Badge */}
+                      {/* Inventory Tracking Toggle Button */}
                       <td className="px-4 py-3.5 text-center">
-                        <span
-                          className={`text-[9.5px] font-extrabold uppercase px-2 py-0.5 rounded-md border ${
+                        <button
+                          type="button"
+                          onClick={() => handleSingleTrackingToggle(product)}
+                          disabled={updateTracking.isPending}
+                          title={isTracked ? "Inventory tracking is ON. Click to turn OFF (no stock attention)" : "Inventory tracking is OFF. Click to turn ON"}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase transition-all shadow-xs border cursor-pointer hover:scale-105 active:scale-95 disabled:opacity-50 ${
                             isTracked
-                              ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                              : 'bg-surface-card border-border-subtle text-text-muted'
+                              ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-400 hover:bg-cyan-500/25 hover:border-cyan-500'
+                              : 'bg-surface-card border-border-subtle text-text-muted hover:text-text-primary hover:border-border-muted'
                           }`}
                         >
-                          {isTracked ? 'Tracked' : 'Off'}
-                        </span>
+                          <span className={`w-1.5 h-1.5 rounded-full ${isTracked ? 'bg-cyan-400 animate-pulse' : 'bg-text-muted'}`} />
+                          <span>{isTracked ? 'Tracked' : 'Off'}</span>
+                        </button>
                       </td>
 
                       {/* Rate Change History Button */}
@@ -495,20 +672,21 @@ export default function ProductManagementView() {
 
                       {/* Actions */}
                       <td className="px-5 py-3.5 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
+                        <div className="flex items-center justify-end gap-2">
                           {isAdmin && (
                             <>
                               <button
                                 onClick={() => { setEditProduct(product); setShowProductForm(true); }}
-                                className="p-1.5 rounded-lg hover:bg-surface-card text-text-muted hover:text-text-primary transition-colors"
+                                className="px-3 py-1.5 rounded-xl bg-brand-500/10 hover:bg-brand-500 text-brand-500 hover:text-white border border-brand-500/30 hover:border-brand-500 text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm active:scale-95"
                                 title="Edit Product"
                               >
-                                <Edit2 size={14} />
+                                <Edit2 size={13} />
+                                <span>Edit</span>
                               </button>
 
                               <button
                                 onClick={() => setDeactivateTarget({ type: 'product', item: product })}
-                                className="p-1.5 rounded-lg hover:bg-rose-500/15 text-text-muted hover:text-rose-400 transition-colors"
+                                className="p-1.5 rounded-xl hover:bg-rose-500/15 text-text-muted hover:text-rose-400 transition-colors"
                                 title={isActive ? 'Soft Delete / Deactivate' : 'Delete / Manage'}
                               >
                                 <Trash2 size={14} />

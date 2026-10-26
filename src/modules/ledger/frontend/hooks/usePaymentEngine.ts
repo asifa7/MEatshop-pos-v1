@@ -202,6 +202,7 @@ export function useRecordPaymentReceipt() {
       amount_paise: number;
       payment_date: string;
       narration?: string | null;
+      reference_number?: string | null;
       idempotency_key?: string | null;
       allocations?: Array<{
         bill_type: 'purchase_invoice' | 'sale_invoice';
@@ -261,3 +262,172 @@ export function useRecordContraEntry() {
     },
   });
 }
+
+export interface VendorBillItem {
+  id: number;
+  invoice_number: string;
+  supplier_invoice_number: string | null;
+  purchase_ref_number: string | null;
+  supplier_id: number;
+  invoice_date: string;
+  created_at: string;
+  total_amount_paise: number;
+  paid_amount_paise: number;
+  outstanding_balance_paise: number;
+  days_old: number;
+  computed_payment_status: 'unpaid' | 'partial' | 'paid';
+}
+
+export interface VendorTileData {
+  supplier_id: number;
+  supplier_name: string;
+  supplier_company: string;
+  phone: string | null;
+  total_outstanding_paise: number;
+  total_purchased_paise: number;
+  pending_bills_count: number;
+  total_bills_count: number;
+  oldest_bill_date: string | null;
+  oldest_bill_days: number;
+  last_payment_date: string | null;
+  last_payment_amount_paise: number | null;
+  credit_days: number;
+  is_overdue: boolean;
+  bills: VendorBillItem[];
+}
+
+export interface VendorPayablesSummaryResponse {
+  summary: {
+    total_payable_paise: number;
+    vendors_count: number;
+    pending_bills_count: number;
+    supplier_credit_days: number;
+  };
+  vendors: VendorTileData[];
+  all_vendors: VendorTileData[];
+}
+
+export interface RecordVendorPaymentInput {
+  supplier_id: number;
+  amount_paise: number;
+  payment_method: 'cash' | 'bank' | 'upi' | 'card';
+  payment_date: string;
+  reference_number?: string | null;
+  narration?: string | null;
+  idempotency_key?: string | null;
+  manual_allocations?: Array<{
+    bill_id: number;
+    allocated_amount_paise: number;
+  }>;
+}
+
+export interface RecordVendorPaymentResult {
+  voucher: PaymentReceiptVoucher;
+  cleared_bills_count: number;
+  partial_bills_count: number;
+  remaining_balance_paise: number;
+  allocations: Array<{
+    bill_type: string;
+    bill_id: number;
+    bill_number: string;
+    allocated_amount_paise: number;
+  }>;
+  message: string;
+}
+
+export interface PayablesHealthReport {
+  is_healthy: boolean;
+  checked_bills_count: number;
+  discrepancies_count: number;
+  discrepancies: Array<{
+    bill_id: number;
+    invoice_number: string;
+    total_amount_paise: number;
+    stored_paid_paise: number;
+    calculated_paid_paise: number;
+    stored_outstanding_paise: number;
+    calculated_outstanding_paise: number;
+    difference_paise: number;
+  }>;
+}
+
+/**
+ * Fetch supplier payables aggregated strictly by vendor (ONE tile per vendor)
+ */
+export function useVendorPayablesSummary(filters?: { search?: string }) {
+  return useQuery<VendorPayablesSummaryResponse>({
+    queryKey: ['payments-receipts', 'vendor-payables', filters?.search],
+    queryFn: async () => {
+      const res = await window.api.invoke(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_VENDOR_PAYABLES, filters);
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+  });
+}
+
+/**
+ * Cashier pays a vendor with automatic FIFO or manual allocation
+ */
+export function useRecordVendorPayment() {
+  const queryClient = useQueryClient();
+  return useMutation<RecordVendorPaymentResult, Error, RecordVendorPaymentInput>({
+    mutationFn: async (input: RecordVendorPaymentInput) => {
+      const res = await window.api.invoke(IPC_CHANNELS.PAYMENTS_RECEIPTS.RECORD_VENDOR_PAYMENT, input);
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payments-receipts'] });
+      queryClient.invalidateQueries({ queryKey: ['suppliers'] });
+      queryClient.invalidateQueries({ queryKey: ['cashbox'] });
+      queryClient.invalidateQueries({ queryKey: ['procurement'] });
+      queryClient.invalidateQueries({ queryKey: ['ledgers'] });
+    },
+  });
+}
+
+/**
+ * Payables health check
+ */
+export function useCheckPayablesHealth() {
+  const queryClient = useQueryClient();
+  return useMutation<PayablesHealthReport, Error, { autoRepair?: boolean } | void>({
+    mutationFn: async (args) => {
+      const res = await window.api.invoke(IPC_CHANNELS.PAYMENTS_RECEIPTS.CHECK_HEALTH, args || {});
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payments-receipts'] });
+    },
+  });
+}
+
+/**
+ * Query and update supplier credit days setting
+ */
+export function useSupplierCreditDays() {
+  return useQuery<number>({
+    queryKey: ['payments-receipts', 'credit-days'],
+    queryFn: async () => {
+      const res = await window.api.invoke(IPC_CHANNELS.PAYMENTS_RECEIPTS.GET_CREDIT_DAYS);
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+  });
+}
+
+export function useUpdateSupplierCreditDays() {
+  const queryClient = useQueryClient();
+  return useMutation<{ success: boolean; credit_days: number }, Error, number>({
+    mutationFn: async (days: number) => {
+      const res = await window.api.invoke(IPC_CHANNELS.PAYMENTS_RECEIPTS.UPDATE_CREDIT_DAYS, { days });
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['payments-receipts'] });
+    },
+  });
+}
+

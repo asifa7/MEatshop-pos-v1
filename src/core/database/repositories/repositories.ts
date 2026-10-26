@@ -23,6 +23,10 @@ import {
   ISupplierReportRepository, SupplierAgingRow, SupplierPurchaseVolumeRow
 } from './repository_interfaces';
 
+function isValidStmt(stmt: any, currentDb: Database): boolean {
+  return Boolean(stmt && stmt.database === currentDb && stmt.database?.open);
+}
+
 export class UserRepository implements IUserRepository {
   constructor(private dbProvider: IDatabaseProvider) {}
 
@@ -36,21 +40,21 @@ export class UserRepository implements IUserRepository {
   private updatePasswordHashStmt: any = null;
 
   public findByUsername(username: string): UserRow | undefined {
-    if (!this.findByUsernameStmt) {
+    if (!isValidStmt(this.findByUsernameStmt, this.db)) {
       this.findByUsernameStmt = this.db.prepare('SELECT * FROM users WHERE username = ?');
     }
     return this.findByUsernameStmt.get(username) as UserRow | undefined;
   }
 
   public findById(id: number): UserRow | undefined {
-    if (!this.findByIdStmt) {
+    if (!isValidStmt(this.findByIdStmt, this.db)) {
       this.findByIdStmt = this.db.prepare('SELECT * FROM users WHERE id = ?');
     }
     return this.findByIdStmt.get(id) as UserRow | undefined;
   }
 
   public findByCode(code: string): UserRow | undefined {
-    if (!this.findByCodeStmt) {
+    if (!isValidStmt(this.findByCodeStmt, this.db)) {
       this.findByCodeStmt = this.db.prepare('SELECT * FROM users WHERE code = ?');
     }
     return this.findByCodeStmt.get(code) as UserRow | undefined;
@@ -67,7 +71,7 @@ export class UserRepository implements IUserRepository {
   }
 
   public updatePasswordHash(id: number, hash: string): void {
-    if (!this.updatePasswordHashStmt) {
+    if (!isValidStmt(this.updatePasswordHashStmt, this.db)) {
       this.updatePasswordHashStmt = this.db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
     }
     this.updatePasswordHashStmt.run(hash, id);
@@ -88,21 +92,21 @@ export class ProductRepository implements IProductRepository {
   private listCategoriesStmt: any = null;
 
   public findAll(): ProductRow[] {
-    if (!this.findAllStmt) {
+    if (!isValidStmt(this.findAllStmt, this.db)) {
       this.findAllStmt = this.db.prepare('SELECT * FROM products WHERE is_active = 1 ORDER BY category, name');
     }
     return this.findAllStmt.all() as ProductRow[];
   }
 
   public findAllWithInactive(): ProductRow[] {
-    if (!this.findAllWithInactiveStmt) {
+    if (!isValidStmt(this.findAllWithInactiveStmt, this.db)) {
       this.findAllWithInactiveStmt = this.db.prepare('SELECT * FROM products ORDER BY category, name');
     }
     return this.findAllWithInactiveStmt.all() as ProductRow[];
   }
 
   public findById(id: number): ProductRow {
-    if (!this.findByIdStmt) {
+    if (!isValidStmt(this.findByIdStmt, this.db)) {
       this.findByIdStmt = this.db.prepare('SELECT * FROM products WHERE id = ?');
     }
     const row = this.findByIdStmt.get(id) as ProductRow | undefined;
@@ -111,7 +115,7 @@ export class ProductRepository implements IProductRepository {
   }
 
   public findByCode(productCode: string): ProductRow | undefined {
-    if (!this.findByCodeStmt) {
+    if (!isValidStmt(this.findByCodeStmt, this.db)) {
       this.findByCodeStmt = this.db.prepare('SELECT * FROM products WHERE product_code = ?');
     }
     return this.findByCodeStmt.get(productCode) as ProductRow | undefined;
@@ -140,7 +144,7 @@ export class ProductRepository implements IProductRepository {
   }
 
   public listCategories(): string[] {
-    if (!this.listCategoriesStmt) {
+    if (!isValidStmt(this.listCategoriesStmt, this.db)) {
       this.listCategoriesStmt = this.db.prepare('SELECT DISTINCT category FROM products WHERE is_active = 1 ORDER BY category');
     }
     const rows = this.listCategoriesStmt.all() as { category: string }[];
@@ -171,7 +175,7 @@ export class ProductRepository implements IProductRepository {
   private findVariantsByProductIdStmt: any = null;
 
   public findAllVariantsActive(): ProductVariantWithProduct[] {
-    if (!this.findAllVariantsActiveStmt) {
+    if (!isValidStmt(this.findAllVariantsActiveStmt, this.db)) {
       this.findAllVariantsActiveStmt = this.db.prepare(`
         SELECT pv.*, COALESCE(pv.product_code, CAST(pv.id AS TEXT)) AS product_code, p.name AS product_name, p.unit_type, p.category
         FROM product_variants pv
@@ -184,7 +188,7 @@ export class ProductRepository implements IProductRepository {
   }
 
   public findVariantById(id: number): ProductVariantWithProduct {
-    if (!this.findVariantByIdStmt) {
+    if (!isValidStmt(this.findVariantByIdStmt, this.db)) {
       this.findVariantByIdStmt = this.db.prepare(`
         SELECT pv.*, COALESCE(pv.product_code, CAST(pv.id AS TEXT)) AS product_code, p.name AS product_name, p.unit_type, p.category
         FROM product_variants pv
@@ -198,7 +202,7 @@ export class ProductRepository implements IProductRepository {
   }
 
   public findVariantsByProductId(productId: number): ProductVariantRow[] {
-    if (!this.findVariantsByProductIdStmt) {
+    if (!isValidStmt(this.findVariantsByProductIdStmt, this.db)) {
       this.findVariantsByProductIdStmt = this.db.prepare(
         'SELECT * FROM product_variants WHERE product_id = ? AND is_active = 1 ORDER BY variant_name'
       );
@@ -284,7 +288,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   private completeInvoiceStmt: any = null;
 
   public create(input: CreateInvoiceRepoInput): Invoice {
-    if (!this.createStmt) {
+    if (!isValidStmt(this.createStmt, this.db)) {
       this.createStmt = this.db.prepare(`
         INSERT INTO invoices (
           status, is_gst_invoice, gst_number_snapshot, customer_id,
@@ -307,7 +311,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   }
 
   public findById(id: number): InvoiceDetail {
-    if (!this.findByIdStmt) {
+    if (!isValidStmt(this.findByIdStmt, this.db)) {
       this.findByIdStmt = this.db.prepare('SELECT * FROM invoices WHERE id = ?');
     }
     const invoice = this.findByIdStmt.get(id) as Invoice | undefined;
@@ -332,7 +336,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   }
 
   public findByInvoiceNumber(invoiceNumber: string): InvoiceDetail | undefined {
-    if (!this.findByInvoiceNumberStmt) {
+    if (!isValidStmt(this.findByInvoiceNumberStmt, this.db)) {
       this.findByInvoiceNumberStmt = this.db.prepare('SELECT * FROM invoices WHERE invoice_number = ?');
     }
     const invoice = this.findByInvoiceNumberStmt.get(invoiceNumber) as Invoice | undefined;
@@ -341,7 +345,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   }
 
   public completeInvoice(id: number, update: CompleteInvoiceUpdate): void {
-    if (!this.completeInvoiceStmt) {
+    if (!isValidStmt(this.completeInvoiceStmt, this.db)) {
       this.completeInvoiceStmt = this.db.prepare(`
         UPDATE invoices SET
           invoice_number = @invoice_number,
@@ -436,7 +440,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   private findItemsByInvoiceIdStmt: any = null;
 
   public addItem(item: AddInvoiceItemRepoInput): InvoiceItem {
-    if (!this.addItemStmt) {
+    if (!isValidStmt(this.addItemStmt, this.db)) {
       this.addItemStmt = this.db.prepare(`
         INSERT INTO invoice_items (
           invoice_id, product_variant_id, quantity_grams, quantity_units,
@@ -472,7 +476,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   }
 
   public updateItemQty(id: number, quantityGrams: number | null, quantityUnits: number | null, subtotalPaise: number, totalPaise: number): void {
-    if (!this.updateItemQtyStmt) {
+    if (!isValidStmt(this.updateItemQtyStmt, this.db)) {
       this.updateItemQtyStmt = this.db.prepare(`
         UPDATE invoice_items SET
           quantity_grams = ?,
@@ -485,15 +489,31 @@ export class InvoiceRepository implements IInvoiceRepository {
     this.updateItemQtyStmt.run(quantityGrams, quantityUnits, subtotalPaise, totalPaise, id);
   }
 
+  private updateItemRateStmt: any = null;
+  public updateItemRate(id: number, ratePaise: number, subtotalPaise: number, totalPaise: number, reason?: string | null): void {
+    if (!isValidStmt(this.updateItemRateStmt, this.db)) {
+      this.updateItemRateStmt = this.db.prepare(`
+        UPDATE invoice_items SET
+          rate_paise_snapshot = ?,
+          line_subtotal_paise = ?,
+          line_total_paise = ?,
+          override_applied = 1,
+          override_reason = ?
+        WHERE id = ?
+      `);
+    }
+    this.updateItemRateStmt.run(ratePaise, subtotalPaise, totalPaise, reason || 'Manual price override', id);
+  }
+
   public removeItem(id: number): void {
-    if (!this.removeItemStmt) {
+    if (!isValidStmt(this.removeItemStmt, this.db)) {
       this.removeItemStmt = this.db.prepare('DELETE FROM invoice_items WHERE id = ?');
     }
     this.removeItemStmt.run(id);
   }
 
   public findItemsByInvoiceId(invoiceId: number): InvoiceItem[] {
-    if (!this.findItemsByInvoiceIdStmt) {
+    if (!isValidStmt(this.findItemsByInvoiceIdStmt, this.db)) {
       this.findItemsByInvoiceIdStmt = this.db.prepare(`
         SELECT ii.*, pv.variant_name, p.name AS product_name, COALESCE(pv.product_code, CAST(pv.id AS TEXT)) AS product_code, p.unit_type, p.category
         FROM invoice_items ii
@@ -546,7 +566,7 @@ export class InvoiceRepository implements IInvoiceRepository {
   private findPaymentsByInvoiceIdStmt: any = null;
 
   public findPaymentsByInvoiceId(invoiceId: number): Payment[] {
-    if (!this.findPaymentsByInvoiceIdStmt) {
+    if (!isValidStmt(this.findPaymentsByInvoiceIdStmt, this.db)) {
       this.findPaymentsByInvoiceIdStmt = this.db.prepare('SELECT * FROM payments WHERE invoice_id = ? ORDER BY received_at');
     }
     return this.findPaymentsByInvoiceIdStmt.all(invoiceId) as Payment[];
@@ -709,7 +729,7 @@ export class InventoryRepository implements IInventoryRepository {
 
   // Ledger
   public findLedgerByVariantId(variantId: number): StockLedgerRow | undefined {
-    if (!this.findLedgerByVariantIdStmt) {
+    if (!isValidStmt(this.findLedgerByVariantIdStmt, this.db)) {
       this.findLedgerByVariantIdStmt = this.db.prepare('SELECT * FROM stock_ledger WHERE product_variant_id = ?');
     }
     return this.findLedgerByVariantIdStmt.get(variantId) as StockLedgerRow | undefined;
@@ -722,8 +742,10 @@ export class InventoryRepository implements IInventoryRepository {
         pv.id as product_variant_id,
         COALESCE(sl.quantity_grams, 0) as quantity_grams,
         COALESCE(sl.quantity_units, 0) as quantity_units,
+        COALESCE(sl.quantity_count, 0) as quantity_count,
         COALESCE(sl.safety_threshold_grams, 5000) as safety_threshold_grams,
         COALESCE(sl.safety_threshold_units, 10) as safety_threshold_units,
+        COALESCE(sl.safety_threshold_count, 5) as safety_threshold_count,
         COALESCE(sl.updated_at, CURRENT_TIMESTAMP) as updated_at,
         pv.variant_name,
         pv.parent_variant_id,
@@ -732,6 +754,8 @@ export class InventoryRepository implements IInventoryRepository {
         p.category,
         pv.unit_type,
         pv.is_processed_cut,
+        p.is_inventory_tracked,
+        COALESCE(pv.track_in_inventory, 1) as track_in_inventory,
         (
           SELECT COALESCE(SUM(ii.quantity_grams), SUM(ii.quantity_units), 0)
           FROM invoice_items ii
@@ -743,19 +767,30 @@ export class InventoryRepository implements IInventoryRepository {
       FROM product_variants pv
       JOIN products p ON pv.product_id = p.id
       LEFT JOIN stock_ledger sl ON sl.product_variant_id = pv.id
-      WHERE pv.is_active = 1
+      WHERE pv.is_active = 1 
+        AND p.is_active = 1 
+        AND COALESCE(pv.track_in_inventory, 1) = 1 
+        AND COALESCE(p.is_inventory_tracked, 1) = 1
       ORDER BY p.category, p.name, pv.variant_name
     `).all() as StockStatusRow[];
   }
 
   public getLowStock(): StockStatusRow[] {
     return this.db.prepare(`
-      SELECT sl.*, pv.variant_name, pv.parent_variant_id, p.name as product_name, p.product_code, p.category, p.unit_type, p.is_processed_cut
+      SELECT sl.*, pv.variant_name, pv.parent_variant_id, p.name as product_name, p.product_code, p.category, p.unit_type, p.is_processed_cut,
+             p.is_inventory_tracked, COALESCE(pv.track_in_inventory, 1) as track_in_inventory
       FROM stock_ledger sl
       JOIN product_variants pv ON sl.product_variant_id = pv.id
       JOIN products p ON pv.product_id = p.id
-      WHERE (p.unit_type = 'weight' AND sl.quantity_grams <= sl.safety_threshold_grams)
-         OR (p.unit_type = 'piece' AND sl.quantity_units <= sl.safety_threshold_units)
+      WHERE pv.is_active = 1 
+        AND p.is_active = 1 
+        AND COALESCE(pv.track_in_inventory, 1) = 1 
+        AND COALESCE(p.is_inventory_tracked, 1) = 1
+        AND (
+          (p.unit_type = 'weight' AND sl.quantity_grams <= sl.safety_threshold_grams)
+          OR (p.unit_type = 'piece' AND sl.quantity_units <= sl.safety_threshold_units)
+          OR (p.unit_type = 'live_dual' AND (sl.quantity_grams <= sl.safety_threshold_grams OR sl.quantity_count <= sl.safety_threshold_count))
+        )
       ORDER BY p.category, p.name, pv.variant_name
     `).all() as StockStatusRow[];
   }
@@ -765,7 +800,7 @@ export class InventoryRepository implements IInventoryRepository {
     
     if (!existing) {
       // Create new ledger entry
-      if (!this.insertLedgerStockStmt) {
+      if (!isValidStmt(this.insertLedgerStockStmt, this.db)) {
         this.insertLedgerStockStmt = this.db.prepare(`
           INSERT INTO stock_ledger (product_variant_id, quantity_grams, quantity_units, safety_threshold_grams, safety_threshold_units)
           VALUES (?, ?, ?, ?, ?)
@@ -788,7 +823,7 @@ export class InventoryRepository implements IInventoryRepository {
         ? (existing.quantity_units ?? 0) + deltaUnits 
         : existing.quantity_units;
 
-      if (!this.updateLedgerStockStmt) {
+      if (!isValidStmt(this.updateLedgerStockStmt, this.db)) {
         this.updateLedgerStockStmt = this.db.prepare(`
           UPDATE stock_ledger SET
             quantity_grams = ?,
@@ -1434,12 +1469,12 @@ export class PurchaseInvoiceRepository implements IPurchaseInvoiceRepository {
           invoice_number, supplier_invoice_number, purchase_ref_number, purchase_order_id, goods_receipt_id, supplier_id, invoice_date,
           subtotal_paise, gst_paise, cgst_paise, sgst_paise, igst_paise, freight_charges_paise, loading_charges_paise,
           packing_charges_paise, other_charges_paise, discount_paise, round_off_paise, total_amount_paise,
-          outstanding_amount_paise, payment_status, status, file_path, created_by
+          outstanding_amount_paise, paid_amount_paise, expected_payment_date, payment_status, status, file_path, created_by
         ) VALUES (
           @invoice_number, @supplier_invoice_number, @purchase_ref_number, @purchase_order_id, @goods_receipt_id, @supplier_id, @invoice_date,
           @subtotal_paise, @gst_paise, @cgst_paise, @sgst_paise, @igst_paise, @freight_charges_paise, @loading_charges_paise,
           @packing_charges_paise, @other_charges_paise, @discount_paise, @round_off_paise, @total_amount_paise,
-          @outstanding_amount_paise, @payment_status, @status, @file_path, @created_by
+          @outstanding_amount_paise, @paid_amount_paise, @expected_payment_date, @payment_status, @status, @file_path, @created_by
         )
       `);
 
@@ -1464,6 +1499,8 @@ export class PurchaseInvoiceRepository implements IPurchaseInvoiceRepository {
         round_off_paise: input.round_off_paise ?? 0,
         total_amount_paise: input.total_amount_paise,
         outstanding_amount_paise: input.outstanding_amount_paise,
+        paid_amount_paise: input.paid_amount_paise ?? 0,
+        expected_payment_date: input.expected_payment_date ?? null,
         payment_status: input.payment_status,
         status: input.status,
         file_path: input.file_path ?? null,

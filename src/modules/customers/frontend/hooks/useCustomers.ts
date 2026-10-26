@@ -13,7 +13,13 @@ import type {
   CrmAlertsSummary,
   AttentionCustomerItem,
   UpiMatchResult,
-  CustomerUpiIdentity
+  CustomerUpiIdentity,
+  FastCustomerLookupResponse,
+  QuickAddCustomerInput,
+  RegularCustomerTile,
+  RecentCustomerItem,
+  RepeatOrderResponse,
+  CustomerTierSettings
 } from '../types/customer.types';
 
 async function invoke<T>(channel: string, args?: unknown): Promise<T> {
@@ -186,4 +192,172 @@ export function useCustomerUpiIdentities(customerId: number | null) {
     enabled: customerId !== null,
   });
 }
+
+// ─── Phase 2 Cashier Hooks ─────────────────────────────────────
+
+export function useFastCustomerLookup(query: string, limit = 8) {
+  const trimmed = typeof query === 'string' ? query.trim() : '';
+  const isDigits = /^\d+$/.test(trimmed);
+  const minLen = isDigits ? 4 : 2;
+
+  return useQuery<FastCustomerLookupResponse>({
+    queryKey: ['fast-customer-lookup', query, limit],
+    queryFn: () => invoke<FastCustomerLookupResponse>(IPC_CHANNELS.CUSTOMERS.FAST_LOOKUP, { query, limit }),
+    enabled: trimmed.length >= minLen,
+    staleTime: 5_000,
+  });
+}
+
+export function useQuickAddCustomer() {
+  const qc = useQueryClient();
+  return useMutation<Customer, Error, QuickAddCustomerInput>({
+    mutationFn: (input) => invoke<Customer>(IPC_CHANNELS.CUSTOMERS.QUICK_ADD, input),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['recent-customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useCustomerRegulars(limit = 16, segmentFilter = 'all', timeSlotFilter = 'all') {
+  return useQuery<RegularCustomerTile[]>({
+    queryKey: ['customer-regulars', limit, segmentFilter, timeSlotFilter],
+    queryFn: () => invoke<RegularCustomerTile[]>(IPC_CHANNELS.CUSTOMERS.GET_REGULARS, { 
+      limit, 
+      segment_filter: segmentFilter,
+      time_slot_filter: timeSlotFilter 
+    }),
+    staleTime: 10_000,
+    refetchInterval: 30_000, // Periodically refresh to stay in sync with time of day
+  });
+}
+
+export function useCustomerTierSettings() {
+  return useQuery<CustomerTierSettings>({
+    queryKey: ['customer-tier-settings'],
+    queryFn: () => invoke<CustomerTierSettings>(IPC_CHANNELS.CUSTOMERS.GET_TIER_SETTINGS),
+    staleTime: 60_000,
+  });
+}
+
+export function useUpdateCustomerTierSettings() {
+  const qc = useQueryClient();
+  return useMutation<CustomerTierSettings, Error, Partial<CustomerTierSettings>>({
+    mutationFn: (settings) => invoke<CustomerTierSettings>(IPC_CHANNELS.CUSTOMERS.UPDATE_TIER_SETTINGS, settings),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customer-tier-settings'] });
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useRecalculateCustomerTiers() {
+  const qc = useQueryClient();
+  return useMutation<{ updatedCount: number; summary: Record<string, number> }, Error, void>({
+    mutationFn: () => invoke<{ updatedCount: number; summary: Record<string, number> }>(IPC_CHANNELS.CUSTOMERS.RECALCULATE_TIERS),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+      qc.invalidateQueries({ queryKey: ['customer-crm-alerts-summary'] });
+    },
+  });
+}
+
+export function useSetManualCustomerTier() {
+  const qc = useQueryClient();
+  return useMutation<{ success: boolean; customer: Customer }, Error, { customer_id: number; tier: string | null; preferred_time_slot?: string | null }>({
+    mutationFn: (payload) => invoke<{ success: boolean; customer: Customer }>(IPC_CHANNELS.CUSTOMERS.SET_MANUAL_TIER, payload),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer', variables.customer_id] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useRecentCustomers(limit = 10) {
+  return useQuery<RecentCustomerItem[]>({
+    queryKey: ['recent-customers', limit],
+    queryFn: () => invoke<RecentCustomerItem[]>(IPC_CHANNELS.CUSTOMERS.GET_RECENTS, { limit }),
+    staleTime: 10_000,
+  });
+}
+
+export function useRepeatOrder(customerId: number | null) {
+  return useQuery<RepeatOrderResponse>({
+    queryKey: ['repeat-order', customerId],
+    queryFn: () => invoke<RepeatOrderResponse>(IPC_CHANNELS.CUSTOMERS.GET_REPEAT_ORDER, { customer_id: customerId }),
+    enabled: customerId !== null,
+    staleTime: 15_000,
+  });
+}
+
+export function useRecordWhatsAppAttempt() {
+  return useMutation<{ success: boolean; logged_at: string }, Error, { invoice_id: number; customer_id?: number | null; phone: string }>({
+    mutationFn: (payload) => invoke<{ success: boolean; logged_at: string }>(IPC_CHANNELS.CUSTOMERS.RECORD_WHATSAPP_ATTEMPT, payload),
+  });
+}
+
+export function useGenerateSeedData() {
+  const qc = useQueryClient();
+  return useMutation<any, Error, void>({
+    mutationFn: () => invoke(IPC_CHANNELS.CUSTOMERS.GENERATE_SEED_DATA),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-crm-alerts-summary'] });
+      qc.invalidateQueries({ queryKey: ['customers-needing-attention'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useClearSeedData() {
+  const qc = useQueryClient();
+  return useMutation<any, Error, void>({
+    mutationFn: () => invoke(IPC_CHANNELS.CUSTOMERS.CLEAR_SEED_DATA),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-crm-alerts-summary'] });
+      qc.invalidateQueries({ queryKey: ['customers-needing-attention'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useIncludeTestData() {
+  return useQuery<{ include_test: boolean }>({
+    queryKey: ['customers-include-test-data'],
+    queryFn: () => invoke<{ include_test: boolean }>(IPC_CHANNELS.CUSTOMERS.GET_INCLUDE_TEST_DATA),
+    staleTime: 5_000,
+  });
+}
+
+export function useSetIncludeTestData() {
+  const qc = useQueryClient();
+  return useMutation<{ include_test: boolean }, Error, boolean>({
+    mutationFn: (include_test: boolean) => invoke<{ include_test: boolean }>(IPC_CHANNELS.CUSTOMERS.SET_INCLUDE_TEST_DATA, { include_test }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['customers-include-test-data'] });
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer-crm-alerts-summary'] });
+      qc.invalidateQueries({ queryKey: ['customers-needing-attention'] });
+      qc.invalidateQueries({ queryKey: ['customer-regulars'] });
+    },
+  });
+}
+
+export function useUpdateCustomerConsent() {
+  const qc = useQueryClient();
+  return useMutation<Customer, Error, { customer_id: number; whatsapp_bill_consent?: number; marketing_consent?: number }>({
+    mutationFn: (payload) => invoke<Customer>(IPC_CHANNELS.CUSTOMERS.UPDATE_CONSENT, payload),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ['customers'] });
+      qc.invalidateQueries({ queryKey: ['customer', variables.customer_id] });
+      qc.invalidateQueries({ queryKey: ['customers-needing-attention'] });
+    },
+  });
+}
+
 

@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState } from 'react';
 import {
   BarChart3,
   Clock,
@@ -8,16 +8,18 @@ import {
   Download,
   Search,
   Filter,
-  CheckCircle2,
-  Calendar,
   Layers,
-  ArrowRight
+  Wallet,
+  MessageCircle,
+  X,
+  Check
 } from 'lucide-react';
 import OutstandingDashboard from './OutstandingDashboard';
 import AgingDashboard from './AgingDashboard';
 import CustomerSearch from './CustomerSearch';
 import { useARReports } from '../hooks/useCustomerLedger';
 import { formatPaise, formatDate, getLedgerRefLabel } from '../types/customer.types';
+import { formatMoney, roundMoney, rupeesToPaise, paiseToRupees } from '../../../../core/shared/math';
 import type { Customer, CustomerStatement } from '../types/customer.types';
 
 type Tab = 'dashboard' | 'aging' | 'statement' | 'collections';
@@ -36,6 +38,16 @@ export default function ARReportsView() {
   const [isStmtLoading, setIsStmtLoading] = useState(false);
   const [stmtError, setStmtError] = useState<string | null>(null);
 
+  // ─── Direct Collect Payment Modal State ──────────────────────
+  const [collectModalOpen, setCollectModalOpen] = useState(false);
+  const [collectCust, setCollectCust] = useState<Customer | null>(null);
+  const [collectAmountRupees, setCollectAmountRupees] = useState<string>('');
+  const [collectMethod, setCollectMethod] = useState<'cash' | 'upi' | 'bank_transfer' | 'card' | 'cheque' | 'advance_adjustment'>('cash');
+  const [collectRef, setCollectRef] = useState('');
+  const [collectNotes, setCollectNotes] = useState('');
+  const [isCollecting, setIsCollecting] = useState(false);
+  const [collectFeedback, setCollectFeedback] = useState<string | null>(null);
+
   // ─── Collections State ───────────────────────────────────────
   const [colStart, setColStart] = useState(firstDayOfMonth);
   const [colEnd, setColEnd] = useState(today);
@@ -43,12 +55,127 @@ export default function ARReportsView() {
   const [colMethod, setColMethod] = useState<string>('all');
 
   const { useCollectionReport } = useARReports();
-  const { data: collectionReport, isLoading: isColLoading, refetch: refetchCol } = useCollectionReport({
+  const { data: collectionReport, refetch: refetchCol } = useCollectionReport({
     startDate: colStart,
     endDate: colEnd,
     customerId: colCustomer ? colCustomer.id : undefined,
     method: colMethod !== 'all' ? colMethod : undefined,
   });
+
+  const openCollectModalForCustomer = (cust: Customer | null) => {
+    const target = cust || selectedCust;
+    setCollectCust(target);
+    if (target && target.outstanding_balance_paise > 0) {
+      setCollectAmountRupees(String(roundMoney(paiseToRupees(target.outstanding_balance_paise))));
+    } else {
+      setCollectAmountRupees('');
+    }
+    setCollectMethod('cash');
+    setCollectRef('');
+    setCollectNotes('');
+    setCollectModalOpen(true);
+  };
+
+  const handleConfirmCollectPayment = async () => {
+    if (!collectCust) return;
+    const amountPaise = rupeesToPaise(roundMoney(parseFloat(collectAmountRupees || '0')));
+    if (amountPaise <= 0) return;
+
+    setIsCollecting(true);
+    try {
+      if (collectMethod === 'advance_adjustment') {
+        const unpaidRes = (await window.api.invoke('customers:get-unpaid-invoices', {
+          customer_id: collectCust.id,
+        })) as { success: boolean; data?: any[] };
+        let remaining = Math.min(amountPaise, collectCust.advance_balance_paise || amountPaise);
+        const allocations: { sale_id: number; invoice_number: string; amount_paise: number }[] = [];
+        for (const inv of unpaidRes.data || []) {
+          if (remaining <= 0) break;
+          const due = Number(inv.balance_due_paise || 0);
+          if (due <= 0) continue;
+          const alloc = Math.min(remaining, due);
+          allocations.push({
+            sale_id: inv.id,
+            invoice_number: inv.invoice_number,
+            amount_paise: alloc,
+          });
+          remaining -= alloc;
+        }
+        if (allocations.length > 0) {
+          await window.api.invoke('customers:apply-advance', {
+            customer_id: collectCust.id,
+            allocations,
+            notes: collectNotes.trim() || 'Advance adjusted against outstanding bills',
+          });
+        } else {
+          await window.api.invoke('customers:record-payment', {
+            customer_id: collectCust.id,
+            amount_paise: amountPaise,
+            method: 'advance_adjustment',
+            payment_date: today,
+            notes: collectNotes.trim() || 'Advance adjusted against outstanding balance',
+          });
+        }
+      } else {
+        await window.api.invoke('customers:record-payment', {
+          customer_id: collectCust.id,
+          amount_paise: amountPaise,
+          method: collectMethod,
+          payment_date: today,
+          reference_number: collectRef.trim() || undefined,
+          notes: collectNotes.trim() || `Counter payment received (${collectMethod.toUpperCase()})`,
+        });
+      }
+
+      setCollectFeedback(`Collected ₹${formatMoney(paiseToRupees(amountPaise))} from ${collectCust.name}`);
+      setTimeout(() => setCollectFeedback(null), 4000);
+      setCollectModalOpen(false);
+      refetchCol();
+      if (selectedCust && selectedCust.id === collectCust.id) {
+        const fresh = await window.api.invoke('customers:get-by-id', { id: collectCust.id });
+        if (fresh?.success && fresh.data) {
+          setSelectedCust(fresh.data);
+          handleFetchStatement(fresh.data);
+        }
+      }
+    } catch (err: any) {
+      alert(err.message || 'Failed to record payment');
+    } finally {
+      setIsCollecting(false);
+    }
+  };
+
+  const handleSendWhatsAppReminder = async (cust: Customer) => {
+    const dueRupees = formatMoney(paiseToRupees(cust.outstanding_balance_paise || 0));
+    const msg = `Namaste ${cust.name}, friendly reminder regarding your outstanding account balance of ₹${dueRupees} (${cust.customer_code}). Kindly arrange settlement at your convenience. Thank you!`;
+    const cleanPhone = (cust.whatsapp || cust.phone || '').replace(/\D/g, '');
+    const waPhone = cleanPhone.length === 10 ? `91${cleanPhone}` : cleanPhone;
+
+    try {
+      const remRes = (await window.api.invoke('customers:create-reminder', {
+        customer_id: cust.id,
+        channel: 'whatsapp',
+        reminder_type: 'payment_due',
+        scheduled_date: today,
+        outstanding_at_time_paise: cust.outstanding_balance_paise || 0,
+        message_text: msg,
+        notes: 'Dispatched via AR Reports WhatsApp Reminder',
+      })) as { success: boolean; data?: { id: number } };
+      if (remRes?.success && remRes.data?.id) {
+        await window.api.invoke('customers:record-whatsapp-attempt', {
+          id: remRes.data.id,
+          success: true,
+        });
+      }
+    } catch (e) {
+      console.error('Failed to log WhatsApp reminder:', e);
+    }
+
+    const url = waPhone
+      ? `https://wa.me/${waPhone}?text=${encodeURIComponent(msg)}`
+      : `https://wa.me/?text=${encodeURIComponent(msg)}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
 
   // Fetch statement
   const handleFetchStatement = async (cust?: Customer) => {
@@ -133,16 +260,16 @@ export default function ARReportsView() {
       getLedgerRefLabel(e.ref_type),
       e.invoice_number || e.ref_id || '',
       `"${(e.description || '').replace(/"/g, '""')}"`,
-      (e.debit_paise / 100).toFixed(2),
-      (e.credit_paise / 100).toFixed(2),
-      (e.running_balance_paise / 100).toFixed(2),
+      formatMoney(paiseToRupees(e.debit_paise)),
+      formatMoney(paiseToRupees(e.credit_paise)),
+      formatMoney(paiseToRupees(e.running_balance_paise)),
     ]);
 
     const fileContent =
       `Customer Statement: ${statementData.customer.name} (${statementData.customer.customer_code})\n` +
       `Period: ${statementData.startDate} to ${statementData.endDate}\n` +
-      `Opening Balance: ${(statementData.opening_balance_paise / 100).toFixed(2)}\n` +
-      `Closing Balance: ${(statementData.closing_balance_paise / 100).toFixed(2)}\n\n` +
+      `Opening Balance: ${formatMoney(paiseToRupees(statementData.opening_balance_paise))}\n` +
+      `Closing Balance: ${formatMoney(paiseToRupees(statementData.closing_balance_paise))}\n\n` +
       [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n');
 
     const blob = new Blob([fileContent], { type: 'text/csv;charset=utf-8;' });
@@ -159,7 +286,7 @@ export default function ARReportsView() {
     if (!collectionReport || !collectionReport.payments) return;
     const header = ['Payment Date', 'Customer Code', 'Customer Name', 'Method', 'Reference #', 'Collected By', 'Allocations', 'Amount Paid (₹)', 'On-Account (₹)'];
     const csvRows = collectionReport.payments.map((p) => {
-      const allocSummary = p.allocations.map((a) => `${a.invoice_number} (₹${(a.allocated_paise / 100).toFixed(2)})`).join('; ') || 'On-Account';
+      const allocSummary = p.allocations.map((a) => `${a.invoice_number} (₹${formatMoney(paiseToRupees(a.allocated_paise))})`).join('; ') || 'On-Account';
       return [
         p.payment_date,
         p.customer_code,
@@ -168,14 +295,14 @@ export default function ARReportsView() {
         p.reference_number || '',
         p.received_by_display || '',
         `"${allocSummary.replace(/"/g, '""')}"`,
-        (p.amount_paise / 100).toFixed(2),
-        (p.unallocated_paise / 100).toFixed(2),
+        formatMoney(paiseToRupees(p.amount_paise)),
+        formatMoney(paiseToRupees(p.unallocated_paise)),
       ];
     });
 
     const fileContent =
       `Customer Collections Report: ${colStart} to ${colEnd}\n` +
-      `Total Collected: ${(collectionReport.total_collected_paise / 100).toFixed(2)}\n\n` +
+      `Total Collected: ${formatMoney(paiseToRupees(collectionReport.total_collected_paise))}\n\n` +
       [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n');
 
     const blob = new Blob([fileContent], { type: 'text/csv;charset=utf-8;' });
@@ -190,36 +317,72 @@ export default function ARReportsView() {
   return (
     <div className="h-full flex flex-col select-none text-xs text-text-secondary">
       {/* Navigation Sub-Tabs */}
-      <div className="flex border-b border-border-subtle bg-surface-card px-6 print:hidden">
-        {[
-          { id: 'dashboard', label: 'Outstanding Dashboard', icon: <Landmark size={14} /> },
-          { id: 'aging', label: 'Aging Schedule', icon: <Clock size={14} /> },
-          { id: 'statement', label: 'Customer Statements', icon: <FileText size={14} /> },
-          { id: 'collections', label: 'Collection Reports', icon: <BarChart3 size={14} /> },
-        ].map((t) => (
+      <div className="flex items-center justify-between border-b border-border-subtle bg-surface-card px-6 print:hidden">
+        <div className="flex">
+          {[
+            { id: 'dashboard', label: 'Outstanding Dashboard', icon: <Landmark size={14} /> },
+            { id: 'aging', label: 'Aging Schedule', icon: <Clock size={14} /> },
+            { id: 'statement', label: 'Customer Statements', icon: <FileText size={14} /> },
+            { id: 'collections', label: 'Collection Reports', icon: <BarChart3 size={14} /> },
+          ].map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id as Tab)}
+              className={`flex items-center gap-2 py-3 px-4 border-b-2 font-bold text-xs transition-colors ${
+                activeTab === t.id
+                  ? 'border-brand-500 text-brand-600 dark:text-brand-400 bg-brand-500/10'
+                  : 'border-transparent text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              {t.icon}
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 py-1.5">
+          {collectFeedback && (
+            <span className="px-3 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-bold text-[11px] flex items-center gap-1">
+              <Check size={12} />
+              {collectFeedback}
+            </span>
+          )}
           <button
-            key={t.id}
-            onClick={() => setActiveTab(t.id as Tab)}
-            className={`flex items-center gap-2 py-3 px-4 border-b-2 font-bold text-xs transition-colors ${
-              activeTab === t.id
-                ? 'border-brand-500 text-brand-600 dark:text-brand-400 bg-brand-500/10'
-                : 'border-transparent text-text-secondary hover:text-text-primary'
-            }`}
+            type="button"
+            onClick={() => openCollectModalForCustomer(selectedCust)}
+            className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-colors"
           >
-            {t.icon}
-            {t.label}
+            <Wallet size={13} />
+            <span>Collect Payment</span>
           </button>
-        ))}
+          {selectedCust && (
+            <button
+              type="button"
+              onClick={() => handleSendWhatsAppReminder(selectedCust)}
+              className="px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-500 font-bold text-xs flex items-center gap-1.5 transition-colors"
+            >
+              <MessageCircle size={13} />
+              <span>WhatsApp Reminder</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Tab Panels */}
       <div className="flex-1 overflow-hidden">
         {activeTab === 'dashboard' && (
           <OutstandingDashboard
-            onSelectCustomer={(c) => {
-              setSelectedCust(c);
+            onSelectCustomer={async (customerId: number) => {
               setActiveTab('statement');
-              handleFetchStatement(c);
+              try {
+                const res = await window.api.invoke('customers:get-by-id', { id: customerId });
+                if (res?.success && res.data) {
+                  setSelectedCust(res.data);
+                  handleFetchStatement(res.data);
+                }
+              } catch (e) {
+                console.error(e);
+              }
             }}
           />
         )}
@@ -314,6 +477,22 @@ export default function ARReportsView() {
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => openCollectModalForCustomer(statementData.customer)}
+                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm"
+                    >
+                      <Wallet size={14} />
+                      <span>Collect Payment</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSendWhatsAppReminder(statementData.customer)}
+                      className="px-3 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-500 rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors"
+                    >
+                      <MessageCircle size={14} />
+                      <span>WhatsApp Reminder</span>
+                    </button>
                     <button
                       onClick={handleExportStatementCSV}
                       className="px-3 py-1.5 bg-surface-panel hover:bg-surface-hover border border-border-subtle rounded-lg font-bold text-xs text-text-primary flex items-center gap-1.5 transition-colors shadow-sm"
@@ -769,6 +948,165 @@ export default function ARReportsView() {
           </div>
         )}
       </div>
+
+      {/* Collect Payment / Advance Adjustment Modal */}
+      {collectModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 print:hidden">
+          <div className="bg-surface-card border border-border-subtle rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-border-subtle bg-surface-panel flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Wallet size={18} className="text-emerald-500" />
+                <h3 className="text-sm font-black text-text-primary">Collect Customer Payment</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCollectModalOpen(false)}
+                className="p-1 rounded-lg hover:bg-surface-hover text-text-secondary"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="block text-[11px] font-bold text-text-primary mb-1">Select Customer *</label>
+                <CustomerSearch
+                  value={collectCust}
+                  onChange={(c) => {
+                    setCollectCust(c);
+                    if (c && c.outstanding_balance_paise > 0) {
+                      setCollectAmountRupees(String(roundMoney(paiseToRupees(c.outstanding_balance_paise))));
+                    }
+                  }}
+                  showBalance={true}
+                />
+              </div>
+
+              {collectCust && (
+                <div className="grid grid-cols-2 gap-3 p-3 rounded-xl bg-surface-panel border border-border-subtle text-xs">
+                  <div>
+                    <span className="text-[10px] text-text-muted uppercase font-bold block">Outstanding Due</span>
+                    <span className="font-mono font-extrabold text-red-500 text-sm">
+                      ₹{formatMoney(paiseToRupees(collectCust.outstanding_balance_paise || 0))}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-text-muted uppercase font-bold block">Advance Available</span>
+                    <span className="font-mono font-extrabold text-emerald-500 text-sm">
+                      ₹{formatMoney(paiseToRupees(collectCust.advance_balance_paise || 0))}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[11px] font-bold text-text-primary">Amount (₹) *</label>
+                  {collectCust && collectCust.outstanding_balance_paise > 0 && (
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setCollectAmountRupees(String(roundMoney(paiseToRupees(collectCust.outstanding_balance_paise))))}
+                        className="px-2 py-0.5 rounded bg-brand-500/15 text-brand-500 font-bold text-[10px]"
+                      >
+                        Full Due
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCollectAmountRupees(String(roundMoney(paiseToRupees(collectCust.outstanding_balance_paise) / 2)))}
+                        className="px-2 py-0.5 rounded bg-surface-panel border border-border-subtle text-text-secondary font-bold text-[10px]"
+                      >
+                        50%
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={collectAmountRupees}
+                  onChange={(e) => setCollectAmountRupees(e.target.value)}
+                  placeholder="0.00"
+                  className="w-full bg-surface-panel border border-border-subtle rounded-xl px-3.5 py-2.5 text-base font-mono font-bold text-text-primary focus:outline-none focus:border-brand-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold text-text-primary mb-1.5">Payment Method</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: 'cash', label: 'Cash' },
+                    { id: 'upi', label: 'UPI' },
+                    { id: 'bank_transfer', label: 'Bank' },
+                    { id: 'card', label: 'Card' },
+                    { id: 'cheque', label: 'Cheque' },
+                    ...(collectCust && (collectCust.advance_balance_paise || 0) > 0
+                      ? [{ id: 'advance_adjustment', label: 'Adjust Advance' }]
+                      : []),
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => setCollectMethod(m.id as any)}
+                      className={`py-2 px-2.5 rounded-xl font-bold text-xs border transition-all ${
+                        collectMethod === m.id
+                          ? 'bg-emerald-600 text-white border-emerald-500 shadow-sm'
+                          : 'bg-surface-panel text-text-secondary border-border-subtle hover:text-text-primary'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {collectMethod !== 'cash' && collectMethod !== 'advance_adjustment' && (
+                <div>
+                  <label className="block text-[11px] font-bold text-text-primary mb-1">Reference / UTR / Cheque #</label>
+                  <input
+                    type="text"
+                    value={collectRef}
+                    onChange={(e) => setCollectRef(e.target.value)}
+                    placeholder="Optional reference number"
+                    className="w-full bg-surface-panel border border-border-subtle rounded-xl px-3 py-2 text-xs font-mono text-text-primary focus:outline-none focus:border-brand-500"
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="block text-[11px] font-bold text-text-primary mb-1">Notes</label>
+                <input
+                  type="text"
+                  value={collectNotes}
+                  onChange={(e) => setCollectNotes(e.target.value)}
+                  placeholder="Optional remark"
+                  className="w-full bg-surface-panel border border-border-subtle rounded-xl px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setCollectModalOpen(false)}
+                  className="px-4 py-2 rounded-xl bg-surface-panel border border-border-subtle text-text-secondary font-bold text-xs"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={!collectCust || isCollecting || !(parseFloat(collectAmountRupees || '0') > 0)}
+                  onClick={handleConfirmCollectPayment}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs disabled:opacity-40 flex items-center gap-1.5 shadow-sm"
+                >
+                  <Check size={14} />
+                  <span>{isCollecting ? 'Recording...' : 'Confirm Payment'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

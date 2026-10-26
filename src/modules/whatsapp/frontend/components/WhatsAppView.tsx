@@ -1,8 +1,8 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { 
-  MessageSquare, RefreshCw, Send, ShieldCheck, User, Users, Phone, 
+  MessageSquare, RefreshCw, Send, ShieldCheck, User, 
   Plus, Search, ChevronLeft, ChevronRight, AlertCircle, CheckCircle2, 
-  X, Megaphone, Copy, DollarSign, Sparkles, RotateCcw
+  X, Megaphone, DollarSign, Sparkles, RotateCcw
 } from 'lucide-react';
 import { useLocation } from 'react-router-dom';
 import { useCustomers, useCreateCustomer } from '../../../customers/frontend/hooks/useCustomers';
@@ -377,7 +377,7 @@ export const WhatsAppView: React.FC<WhatsAppViewProps> = ({ initialPhone, initia
         phone: cleanPhone,
         whatsapp: cleanPhone,
         category: newCustCategory,
-        credit_allowed: creditLimitPaise > 0,
+        credit_allowed: creditLimitPaise > 0 ? 1 : 0,
         credit_limit_paise: creditLimitPaise,
         status: 'active'
       });

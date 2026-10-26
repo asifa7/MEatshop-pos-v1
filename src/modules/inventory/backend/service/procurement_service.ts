@@ -38,6 +38,7 @@ import { db } from '../../../../core/backend/db';
 import { productVariantsRepository } from '../../../billing/backend/repository/product_variants_repository';
 import { ValidationError, NotFoundError } from '../../../../core/backend/errors';
 import { inventoryLedgerService } from './inventory_ledger_service';
+import { ledgerService } from '../../../ledger/backend/service/ledger_service';
 import {
   CreatePurchaseOrderSchema,
   GoodsReceiptSchema,
@@ -228,11 +229,32 @@ export class ProcurementService {
           reference_id: grn.id,
         });
 
-        // 2. If it is live chicken, also record in live_chicken_batches for yield/mortality tracking
-        if (isLiveChicken) {
+        // 2. If it is a live animal, also record in live_chicken_batches for yield/mortality tracking
+        const configRow = db.prepare('SELECT animal_key FROM live_animal_yield_configs WHERE live_variant_id = ?').get(item.product_variant_id) as { animal_key: string } | undefined;
+        let detectedAnimalKey: string | null = configRow?.animal_key || null;
+        if (!detectedAnimalKey) {
+          const pName = ((product?.name || '') + ' ' + (variant?.variant_name || '')).toLowerCase();
+          const pCat = (product?.category || '').toLowerCase();
+          if (pName.includes('mutton') || pCat.includes('mutton')) detectedAnimalKey = 'mutton';
+          else if (pName.includes('country chicken') || pName.includes('cc live') || pCat.includes('country chicken')) detectedAnimalKey = 'country_chicken';
+          else if (pName.includes('quail') || pName.includes('quil') || pCat.includes('quail')) detectedAnimalKey = 'quils';
+          else if (pName.includes('duck')) detectedAnimalKey = 'ducks';
+          else if (pName.includes('rabbit')) detectedAnimalKey = 'rabbit';
+          else if (pName.includes('chicken') || pCat.includes('chicken')) detectedAnimalKey = 'chicken';
+        }
+
+        if (detectedAnimalKey && (isLiveDual || isLiveChicken || isWeight)) {
           const liveWeightGrams = deltaGrams ?? 0;
           const poItem = item.purchase_order_item_id ? db.prepare('SELECT * FROM purchase_order_items WHERE id = ?').get(item.purchase_order_item_id) as any : null;
-          const countVal = poItem?.count || Math.max(1, Math.round((liveWeightGrams || 1600) / 1600));
+          let defaultAnimalWeightG = 1600;
+          if (detectedAnimalKey === 'mutton') defaultAnimalWeightG = 10000;
+          else if (detectedAnimalKey === 'quils') defaultAnimalWeightG = 200;
+          else if (detectedAnimalKey === 'ducks') defaultAnimalWeightG = 2000;
+          else if (detectedAnimalKey === 'rabbit') defaultAnimalWeightG = 2500;
+          else if (detectedAnimalKey === 'country_chicken') defaultAnimalWeightG = 1400;
+
+          const countVal = poItem?.count || Math.max(1, Math.round((liveWeightGrams || defaultAnimalWeightG) / defaultAnimalWeightG));
+          const countMilli = countVal * 1000;
 
           const cleanBatchDate = parsed.data.received_date.replace(/[^0-9]/g, '').slice(0, 8);
           const countRow = db.prepare('SELECT COUNT(*) as cnt FROM live_chicken_batches').get() as { cnt: number };
@@ -241,12 +263,13 @@ export class ProcurementService {
 
           db.prepare(`
             INSERT INTO live_chicken_batches (
-              batch_number, supplier_id, purchase_date,
+              batch_number, animal_type, supplier_id, purchase_date,
               cost_per_kg_paise, initial_weight_grams, initial_count,
-              remaining_weight_grams, remaining_count, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+              remaining_weight_grams, remaining_count, remaining_count_milli, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
           `).run(
             batchNum,
+            detectedAnimalKey,
             parsed.data.supplier_id,
             parsed.data.received_date,
             poItem?.unit_price_paise || variant?.current_rate_paise_per_unit || 0,
@@ -254,7 +277,8 @@ export class ProcurementService {
             countVal,
             liveWeightGrams,
             countVal,
-            `GRN Receipt #${grnNumber}`
+            countMilli,
+            `GRN Receipt #${grnNumber} (${detectedAnimalKey})`
           );
         }
       }
@@ -322,6 +346,35 @@ export class ProcurementService {
         debit_paise: 0,
         status: 'approved',
       });
+
+      const suppRow = db.prepare('SELECT name, company_name FROM suppliers WHERE id = ?').get(parsed.data.supplier_id) as { name?: string; company_name?: string } | undefined;
+      const supplierName = suppRow?.company_name || suppRow?.name || `Supplier #${parsed.data.supplier_id}`;
+
+      ledgerService.postDoubleEntry({
+        date: parsed.data.invoice_date,
+        referenceId: invoice.invoice_number,
+        description: `Purchase Invoice ${parsed.data.supplier_invoice_number} (${invoice.invoice_number}) from ${supplierName}`,
+        debitAccount: 'Purchase',
+        creditAccount: 'Supplier',
+        amountPaise: parsed.data.total_amount_paise,
+        partyType: 'Supplier',
+        partyId: parsed.data.supplier_id,
+        partyName: supplierName,
+        createdBy: userId,
+        voucherGroupId: `VCH-PUR-${invoice.id}`,
+        sourceModule: 'PURCHASE',
+      });
+
+      db.prepare(`
+        UPDATE suppliers
+        SET outstanding_balance_paise = COALESCE(opening_balance_paise, 0) + COALESCE((
+            SELECT SUM(credit_paise) - SUM(debit_paise)
+            FROM supplier_ledger
+            WHERE supplier_ledger.supplier_id = suppliers.id
+              AND supplier_ledger.status != 'rejected'
+        ), 0)
+        WHERE id = ?
+      `).run(parsed.data.supplier_id);
 
       // 3. Update stock ledger & inventory_ledger for each purchased item
       parsed.data.items.forEach((item, idx) => {
@@ -553,6 +606,56 @@ export class ProcurementService {
       const approvalStatus = 'approved';
       const cleanDate = parsed.data.received_date.replace(/[^0-9]/g, '').slice(0, 8);
 
+      // If draft, save invoice with status='draft' and do not update stock or batches
+      if (parsed.data.is_draft) {
+        const invoiceNumber = `PI-${cleanDate}-${Date.now().toString().slice(-4)}`;
+        const purchaseRefNumber = this.getNextPurchaseRefNumber(parsed.data.received_date);
+        let supplierBillNumber = (parsed.data.supplier_invoice_number || parsed.data.bill_number || '').trim();
+        if (!supplierBillNumber) {
+          supplierBillNumber = this.generateAutoBillNumber(parsed.data.received_date);
+        }
+
+        const subtotalPaise = parsed.data.items.reduce((sum, item) => sum + item.subtotal_paise, 0);
+        const discountPaise = parsed.data.discount_paise || 0;
+        const taxPaise = parsed.data.tax_paise || 0;
+        const freightChargesPaise = parsed.data.freight_charges_paise || 0;
+        const otherChargesPaise = parsed.data.other_charges_paise || 0;
+        const finalTotalPaise = Math.max(0, subtotalPaise - discountPaise + taxPaise + freightChargesPaise + otherChargesPaise);
+        const paidAmountPaise = Math.min(parsed.data.paid_amount_paise || 0, finalTotalPaise);
+        const outstandingAmountPaise = Math.max(0, finalTotalPaise - paidAmountPaise);
+
+        const invoice = this.purchaseInvoiceRepo.create({
+          invoice_number: invoiceNumber,
+          supplier_invoice_number: supplierBillNumber,
+          purchase_ref_number: purchaseRefNumber,
+          supplier_id: parsed.data.supplier_id,
+          invoice_date: parsed.data.received_date,
+          subtotal_paise: subtotalPaise,
+          discount_paise: discountPaise,
+          gst_paise: taxPaise,
+          freight_charges_paise: freightChargesPaise,
+          other_charges_paise: otherChargesPaise,
+          total_amount_paise: finalTotalPaise,
+          outstanding_amount_paise: outstandingAmountPaise,
+          paid_amount_paise: paidAmountPaise,
+          expected_payment_date: parsed.data.expected_payment_date || null,
+          payment_status: paidAmountPaise === 0 ? 'unpaid' : (paidAmountPaise >= finalTotalPaise ? 'paid' : 'partially_paid'),
+          status: 'draft',
+          file_path: parsed.data.bill_photo_path,
+          created_by: userId,
+          items: parsed.data.items.map(item => ({
+            product_variant_id: item.product_variant_id,
+            quantity: item.quantity,
+            unit_price_paise: item.unit_price_paise,
+            gst_rate_bps: 0,
+            gst_amount_paise: 0,
+            total_amount_paise: item.subtotal_paise,
+          })),
+        });
+
+        return { invoice, isDraft: true };
+      }
+
       // 1. Create PO
       const poRepoInput: CreatePurchaseOrderRepoInput = {
         po_number: `PO-${cleanDate}-${Date.now().toString().slice(-4)}`,
@@ -610,41 +713,80 @@ export class ProcurementService {
         const deltaUnits = !isWeight ? item.quantity : null;
         const countValue = isLiveDual && item.count !== undefined ? item.count : (isLiveChicken ? Math.max(1, Math.round((deltaGrams || 1600) / 1600)) : null);
 
-        // 1. Every purchase without exception increments regular inventory in stock_ledger
-        this.inventoryRepo.updateLedgerStock(item.product_variant_id, deltaGrams, deltaUnits);
+        // Check if this variant is mapped to an animal in live_animal_yield_configs or matches an animal keyword
+        const configRow = db.prepare('SELECT animal_key FROM live_animal_yield_configs WHERE live_variant_id = ?').get(item.product_variant_id) as { animal_key: string } | undefined;
+        let detectedAnimalKey: string | null = configRow?.animal_key || null;
+        if (!detectedAnimalKey) {
+          const pName = ((product?.name || '') + ' ' + (variant?.variant_name || '')).toLowerCase();
+          const pCat = (product?.category || '').toLowerCase();
+          if (pName.includes('mutton') || pCat.includes('mutton')) detectedAnimalKey = 'mutton';
+          else if (pName.includes('country chicken') || pName.includes('cc live') || pCat.includes('country chicken')) detectedAnimalKey = 'country_chicken';
+          else if (pName.includes('quail') || pName.includes('quil') || pCat.includes('quail')) detectedAnimalKey = 'quils';
+          else if (pName.includes('duck')) detectedAnimalKey = 'ducks';
+          else if (pName.includes('rabbit')) detectedAnimalKey = 'rabbit';
+          else if (pName.includes('chicken') || pCat.includes('chicken')) detectedAnimalKey = 'chicken';
+        }
 
-        this.inventoryRepo.createTransaction({
-          product_variant_id: item.product_variant_id,
-          transaction_type: 'manual_adjustment',
-          reference_id: po.id,
-          quantity_grams: deltaGrams,
-          quantity_units: deltaUnits,
-        });
-
-        // 2. If it is live chicken, also record in live_chicken_batches for yield/mortality tracking
-        if (isLiveChicken) {
+        if (detectedAnimalKey && (isLiveDual || isLiveChicken || isWeight)) {
+          // Live animal purchase adds to live pool of that animal_type
           const liveWeightGrams = deltaGrams ?? 0;
-          const birdCount = countValue ?? 1;
+          let defaultAnimalWeightG = 1600;
+          if (detectedAnimalKey === 'mutton') defaultAnimalWeightG = 10000;
+          else if (detectedAnimalKey === 'quils') defaultAnimalWeightG = 200;
+          else if (detectedAnimalKey === 'ducks') defaultAnimalWeightG = 2000;
+          else if (detectedAnimalKey === 'rabbit') defaultAnimalWeightG = 2500;
+          else if (detectedAnimalKey === 'country_chicken') defaultAnimalWeightG = 1400;
+
+          const animalCount = countValue ?? Math.max(1, Math.round((liveWeightGrams || defaultAnimalWeightG) / defaultAnimalWeightG));
+          const countMilli = animalCount * 1000;
           const costPerKgPaise = item.unit_price_paise || 0;
 
           const batchNum = `BAT-LIVE-${cleanDate}-${po.id}-${idx + 1}`;
           db.prepare(`
             INSERT INTO live_chicken_batches (
-              batch_number, supplier_id, purchase_date,
+              batch_number, animal_type, supplier_id, purchase_date,
               cost_per_kg_paise, initial_weight_grams, initial_count,
-              remaining_weight_grams, remaining_count, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+              remaining_weight_grams, remaining_count, remaining_count_milli, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
           `).run(
             batchNum,
+            detectedAnimalKey,
             parsed.data.supplier_id,
             parsed.data.received_date,
             costPerKgPaise,
             liveWeightGrams,
-            birdCount,
+            animalCount,
             liveWeightGrams,
-            birdCount,
-            `Quick Purchase PO #${po.po_number}`
+            animalCount,
+            countMilli,
+            `Quick Purchase PO #${po.po_number} (${detectedAnimalKey})`
           );
+        } else {
+          // If yield_enabled is OFF or not live chicken: purchases add straight to product stock ledger
+          this.inventoryRepo.updateLedgerStock(item.product_variant_id, deltaGrams, deltaUnits);
+
+          const { inventoryLedgerService } = require('./inventory_ledger_service');
+          inventoryLedgerService.recordMovement({
+            product_variant_id: item.product_variant_id,
+            branch_id: 1,
+            action_type: 'PURCHASE',
+            quantity_grams: deltaGrams,
+            quantity_units: deltaUnits,
+            unit_cost_paise: item.unit_price_paise,
+            reference_type: 'purchase_order',
+            reference_id: po.id,
+            reference_number: po.po_number,
+            notes: `Purchase receipt PO #${po.po_number}`,
+            created_by: userId,
+          });
+
+          this.inventoryRepo.createTransaction({
+            product_variant_id: item.product_variant_id,
+            transaction_type: 'manual_adjustment',
+            reference_id: po.id,
+            quantity_grams: deltaGrams,
+            quantity_units: deltaUnits,
+          });
         }
 
           // Create distinct Stock Batch for FIFO tracking
@@ -677,11 +819,34 @@ export class ProcurementService {
         productVariantsRepository.syncVariantCostCache(item.product_variant_id);
       });
 
-      // 3. Create Purchase Invoice
+      // 3. Compute Totals & Charges Breakdown
+      const subtotalPaise = parsed.data.items.reduce((sum, item) => sum + item.subtotal_paise, 0);
+      const discountPaise = parsed.data.discount_paise || 0;
+      const taxPaise = parsed.data.tax_paise || 0;
+      const freightChargesPaise = parsed.data.freight_charges_paise || 0;
+      const otherChargesPaise = parsed.data.other_charges_paise || 0;
+      const finalTotalPaise = Math.max(0, subtotalPaise - discountPaise + taxPaise + freightChargesPaise + otherChargesPaise);
+
+      // Determine Payment Mode and Paid Amount
+      let paidAmountPaise = 0;
+      if (['cash', 'upi', 'card'].includes(parsed.data.payment_method)) {
+        paidAmountPaise = parsed.data.paid_amount_paise > 0 ? parsed.data.paid_amount_paise : finalTotalPaise;
+      } else if (parsed.data.payment_method === 'partial') {
+        paidAmountPaise = Math.min(parsed.data.paid_amount_paise || 0, finalTotalPaise);
+      } else {
+        // credit
+        paidAmountPaise = 0;
+      }
+
+      const outstandingAmountPaise = Math.max(0, finalTotalPaise - paidAmountPaise);
+      const paymentStatus: 'unpaid' | 'partially_paid' | 'paid' =
+        outstandingAmountPaise === 0 ? 'paid' : (paidAmountPaise > 0 ? 'partially_paid' : 'unpaid');
+
+      // Create Purchase Invoice
       const invoiceNumber = `PI-${cleanDate}-${Date.now().toString().slice(-4)}`;
       const purchaseRefNumber = this.getNextPurchaseRefNumber(parsed.data.received_date);
 
-      let supplierBillNumber = parsed.data.bill_number ? parsed.data.bill_number.trim() : '';
+      let supplierBillNumber = (parsed.data.supplier_invoice_number || parsed.data.bill_number || '').trim();
       if (!supplierBillNumber) {
         supplierBillNumber = this.generateAutoBillNumber(parsed.data.received_date);
       }
@@ -694,10 +859,16 @@ export class ProcurementService {
         goods_receipt_id: grn.id,
         supplier_id: parsed.data.supplier_id,
         invoice_date: parsed.data.received_date,
-        subtotal_paise: parsed.data.bill_amount_paise,
-        total_amount_paise: parsed.data.bill_amount_paise,
-        outstanding_amount_paise: parsed.data.payment_method === 'cash' ? 0 : parsed.data.bill_amount_paise,
-        payment_status: parsed.data.payment_method === 'cash' ? 'paid' : 'unpaid',
+        subtotal_paise: subtotalPaise,
+        discount_paise: discountPaise,
+        gst_paise: taxPaise,
+        freight_charges_paise: freightChargesPaise,
+        other_charges_paise: otherChargesPaise,
+        total_amount_paise: finalTotalPaise,
+        outstanding_amount_paise: outstandingAmountPaise,
+        paid_amount_paise: paidAmountPaise,
+        expected_payment_date: parsed.data.expected_payment_date || null,
+        payment_status: paymentStatus,
         status: approvalStatus,
         file_path: parsed.data.bill_photo_path,
         created_by: userId,
@@ -712,15 +883,33 @@ export class ProcurementService {
       };
       const invoice = this.purchaseInvoiceRepo.create(invoiceRepoInput);
 
-      // 4. Create Supplier Ledger
+      // 4. Create Supplier Ledger Credit Entry for purchase total
       this.supplierLedgerRepo.create({
         supplier_id: parsed.data.supplier_id,
         entry_date: parsed.data.received_date,
         ref_type: 'purchase_invoice',
         ref_id: invoice.id,
         description: `Quick Purchase: ${invoiceRepoInput.supplier_invoice_number}`,
-        credit_paise: parsed.data.bill_amount_paise,
+        credit_paise: finalTotalPaise,
         status: approvalStatus,
+      });
+
+      const suppRow = db.prepare('SELECT name, company_name FROM suppliers WHERE id = ?').get(parsed.data.supplier_id) as { name?: string; company_name?: string } | undefined;
+      const supplierName = suppRow?.company_name || suppRow?.name || `Supplier #${parsed.data.supplier_id}`;
+
+      ledgerService.postDoubleEntry({
+        date: parsed.data.received_date,
+        referenceId: invoice.invoice_number,
+        description: `Purchase Bill ${invoiceRepoInput.supplier_invoice_number} (${invoice.invoice_number}) from ${supplierName}`,
+        debitAccount: 'Purchase',
+        creditAccount: 'Supplier',
+        amountPaise: finalTotalPaise,
+        partyType: 'Supplier',
+        partyId: parsed.data.supplier_id,
+        partyName: supplierName,
+        createdBy: userId,
+        voucherGroupId: `VCH-PUR-${invoice.id}`,
+        sourceModule: 'PURCHASE',
       });
 
       // 4b. Log to inventory_ledger for unified stock tracking
@@ -744,15 +933,19 @@ export class ProcurementService {
         });
       });
 
-      // 5. Cash Payment handling
-      if (parsed.data.payment_method === 'cash') {
+      // 5. Payment handling if paidAmountPaise > 0
+      if (paidAmountPaise > 0) {
+        const paymentMethodMapped = ['cash', 'upi', 'card'].includes(parsed.data.payment_method)
+          ? parsed.data.payment_method as any
+          : 'cash';
+
         const payment = container.supplierPaymentRepository.create({
           supplier_id: parsed.data.supplier_id,
-          amount_paise: parsed.data.bill_amount_paise,
-          payment_method: 'cash',
-          reference_number: `CASH-${invoice.invoice_number}`,
+          amount_paise: paidAmountPaise,
+          payment_method: paymentMethodMapped,
+          reference_number: `PAY-${invoice.invoice_number}`,
           payment_date: parsed.data.received_date,
-          notes: `Cash payment for invoice ${invoice.supplier_invoice_number}`,
+          notes: `Payment (${parsed.data.payment_method.toUpperCase()}) for invoice ${invoice.supplier_invoice_number}`,
           is_advance: 0,
           unallocated_amount_paise: 0,
           created_by: userId,
@@ -763,8 +956,8 @@ export class ProcurementService {
           entry_date: parsed.data.received_date,
           ref_type: 'payment',
           ref_id: payment.id,
-          description: `Cash Payment for Invoice: ${invoice.supplier_invoice_number}`,
-          debit_paise: parsed.data.bill_amount_paise,
+          description: `Payment for Invoice: ${invoice.supplier_invoice_number}`,
+          debit_paise: paidAmountPaise,
           credit_paise: 0,
           status: approvalStatus,
         });
@@ -772,8 +965,52 @@ export class ProcurementService {
         db.prepare(`
           INSERT INTO supplier_payment_allocations (supplier_payment_id, purchase_invoice_id, allocated_amount_paise)
           VALUES (?, ?, ?)
-        `).run(payment.id, invoice.id, parsed.data.bill_amount_paise);
+        `).run(payment.id, invoice.id, paidAmountPaise);
+
+        const creditAccount = paymentMethodMapped === 'cash' ? 'Cash' : 'Bank';
+        ledgerService.postDoubleEntry({
+          date: parsed.data.received_date,
+          referenceId: `PAY-${invoice.invoice_number}`,
+          description: `Supplier Payment (${paymentMethodMapped.toUpperCase()}) to ${supplierName} for Bill ${invoice.supplier_invoice_number}`,
+          debitAccount: 'Supplier',
+          creditAccount,
+          amountPaise: paidAmountPaise,
+          partyType: 'Supplier',
+          partyId: parsed.data.supplier_id,
+          partyName: supplierName,
+          createdBy: userId,
+          voucherGroupId: `VCH-SPAY-${payment.id}`,
+          sourceModule: 'SUPPLIER_PAYMENT',
+        });
+
+        if (paymentMethodMapped === 'cash') {
+          try {
+            db.prepare(`
+              INSERT INTO store_cash_box (entry_type, category, amount_paise, description, reference_id, recorded_by, is_active, created_at)
+              VALUES ('cash_out', 'Supplier Payment', ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+            `).run(
+              paidAmountPaise,
+              `Quick Purchase Cash Payment to ${supplierName} (${invoice.supplier_invoice_number})`,
+              `PAY-${invoice.invoice_number}`,
+              userId
+            );
+          } catch {
+            // non-fatal if store_cash_box differs
+          }
+        }
       }
+
+      // Re-sync supplier outstanding_balance_paise to match actual ledger
+      db.prepare(`
+        UPDATE suppliers
+        SET outstanding_balance_paise = COALESCE(opening_balance_paise, 0) + COALESCE((
+            SELECT SUM(credit_paise) - SUM(debit_paise)
+            FROM supplier_ledger
+            WHERE supplier_ledger.supplier_id = suppliers.id
+              AND supplier_ledger.status != 'rejected'
+        ), 0)
+        WHERE id = ?
+      `).run(parsed.data.supplier_id);
 
       return { invoice };
     });
@@ -820,6 +1057,29 @@ export class ProcurementService {
     `).run(dateStr, nextSeq, nextSeq);
 
     return `PUR-${dateStr}-${String(nextSeq).padStart(3, '0')}`;
+  }
+
+  public getLastPurchaseRate(supplierId: number, productVariantId: number): number | null {
+    if (!supplierId || !productVariantId) return null;
+    const db = container.databaseProvider.getRawConnection();
+    const row = db.prepare(`
+      SELECT unit_price_paise 
+      FROM supplier_price_history 
+      WHERE supplier_id = ? AND product_variant_id = ?
+      ORDER BY effective_date DESC, id DESC LIMIT 1
+    `).get(supplierId, productVariantId) as { unit_price_paise: number } | undefined;
+    return row ? row.unit_price_paise : null;
+  }
+
+  public checkDuplicateSupplierInvoice(supplierId: number, supplierInvoiceNumber: string): boolean {
+    if (!supplierId || !supplierInvoiceNumber || !supplierInvoiceNumber.trim()) return false;
+    const db = container.databaseProvider.getRawConnection();
+    const countRow = db.prepare(`
+      SELECT COUNT(*) as cnt 
+      FROM purchase_invoices 
+      WHERE supplier_id = ? AND LOWER(TRIM(supplier_invoice_number)) = LOWER(TRIM(?)) AND status != 'rejected'
+    `).get(supplierId, supplierInvoiceNumber.trim()) as { cnt: number };
+    return countRow ? countRow.cnt > 0 : false;
   }
 
   public getSupplierSnapshot(supplierId: number): SupplierSnapshot | null {

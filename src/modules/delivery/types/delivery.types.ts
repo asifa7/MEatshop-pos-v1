@@ -241,6 +241,7 @@ export interface DeliveryFilterState {
   status?: string; // 'all' or specific DeliveryStatus
   zoneId?: string; // 'all' or number string
   driverId?: string; // 'all' or number string
+  customerId?: string | number;
   priority?: string; // 'all' or DeliveryPriority
   datePreset?: string;
   startDate?: string;

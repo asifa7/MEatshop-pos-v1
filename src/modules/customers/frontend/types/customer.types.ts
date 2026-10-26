@@ -56,6 +56,13 @@ export interface Customer {
   packaging_preference?: string | null;
   special_instructions?: string | null;
   notes: string | null;
+  phone_normalized?: string | null;
+  locality?: string | null;
+  whatsapp_bill_consent?: number;
+  marketing_consent?: number;
+  manual_tier?: string | null;
+  preferred_time_slot?: string | null;
+  is_test?: number;
   created_by: number | null;
   updated_by: number | null;
   created_at: string;
@@ -555,6 +562,12 @@ export function getSegmentBadgeStyle(segment?: string | null): {
       return { bg: 'bg-blue-100 dark:bg-blue-500/15', text: 'text-blue-800 dark:text-blue-300', border: 'border-blue-300 dark:border-blue-500/40', icon: '🧾', label: 'Credit Account' };
     case 'Business Customer':
       return { bg: 'bg-purple-100 dark:bg-purple-500/15', text: 'text-purple-800 dark:text-purple-300', border: 'border-purple-300 dark:border-purple-500/40', icon: '🏪', label: 'Business' };
+    case 'Rare':
+      return { bg: 'bg-purple-100 dark:bg-purple-500/15', text: 'text-purple-800 dark:text-purple-300', border: 'border-purple-300 dark:border-purple-500/40', icon: '⏳', label: 'Rare' };
+    case 'Wholesale':
+      return { bg: 'bg-blue-100 dark:bg-blue-500/15', text: 'text-blue-800 dark:text-blue-300', border: 'border-blue-300 dark:border-blue-500/40', icon: '📦', label: 'Wholesale' };
+    case 'Restaurant':
+      return { bg: 'bg-indigo-100 dark:bg-indigo-500/15', text: 'text-indigo-800 dark:text-indigo-300', border: 'border-indigo-300 dark:border-indigo-500/40', icon: '🍽️', label: 'Restaurant' };
     case 'New':
     default:
       return { bg: 'bg-cyan-100 dark:bg-cyan-500/15', text: 'text-cyan-800 dark:text-cyan-300', border: 'border-cyan-300 dark:border-cyan-500/40', icon: '🆕', label: 'New' };
@@ -586,8 +599,15 @@ export interface AttentionCustomerItem {
   customer_id: number;
   customer_code: string;
   name: string;
+  phone?: string;
+  whatsapp_bill_consent?: number;
+  marketing_consent?: number;
   category: string;
   customer_segment: CustomerSegmentType;
+  tags?: string[];
+  is_credit_customer?: boolean;
+  has_credit_due?: boolean;
+  credit_status?: string;
   segment_health_summary: string;
   average_visit_interval: number | null;
   last_purchase_date: string | null;
@@ -641,6 +661,122 @@ export interface CustomerUpiIdentity {
   auto_link: number;
   last_seen_at: string;
   created_at: string;
+}
+
+// ─── Phase 2 Cashier & Fast Lookup Types ───────────────────────
+
+export interface FastCustomerLookupResult {
+  id: number;
+  customer_code: string;
+  name: string;
+  phone: string | null;
+  phone_normalized: string | null;
+  masked_phone: string;
+  matched_digits: string | null;
+  locality: string;
+  outstanding_balance_paise: number;
+  advance_balance_paise: number;
+  credit_allowed: number;
+  credit_limit_paise: number;
+  segment: string;
+  visit_count: number;
+  last_visit_date: string | null;
+  last_visit_relative: string;
+  usual_item_summary: string;
+  cutting_preference: string;
+  whatsapp_bill_consent: number;
+  marketing_consent: number;
+}
+
+export interface FastCustomerLookupResponse {
+  results: FastCustomerLookupResult[];
+  totalMatches: number;
+  collision: boolean;
+  hint?: string;
+}
+
+export interface QuickAddCustomerInput {
+  name?: string;
+  phone: string;
+  whatsapp_bill_consent?: boolean;
+  marketing_consent?: boolean;
+}
+
+export interface CustomerTierSettings {
+  id: number;
+  vip_min_spend_paise: number;
+  vip_min_visits: number;
+  vip_criteria_mode: 'either' | 'both';
+  regular_min_visits: number;
+  rare_inactive_days: number;
+  updated_at?: string;
+}
+
+export interface RegularCustomerTile {
+  id: number;
+  customer_code: string;
+  name: string;
+  initials: string;
+  phone?: string | null;
+  phone_normalized: string | null;
+  segment: string;
+  manual_tier?: string | null;
+  category?: string;
+  price_tier?: string;
+  outstanding_balance_paise: number;
+  visit_count: number;
+  total_spend_paise: number;
+  last_visit_date: string | null;
+  days_since_last_purchase?: number | null;
+  usual_time_slot: 'morning' | 'afternoon' | 'evening' | 'flexible';
+  is_time_match: boolean;
+  current_store_slot: 'morning' | 'afternoon' | 'evening';
+  morning_visits?: number;
+  afternoon_visits?: number;
+  evening_visits?: number;
+  usual_item_summary: string;
+  cutting_preference: string;
+}
+
+export interface RecentCustomerItem {
+  id: number;
+  customer_code: string;
+  name: string;
+  phone: string | null;
+  phone_normalized: string | null;
+  masked_phone: string;
+  outstanding_balance_paise: number;
+  segment: string;
+  usual_item_summary: string;
+}
+
+export interface RepeatOrderItem {
+  product_variant_id: number;
+  product_id: number;
+  product_name: string;
+  variant_name: string;
+  unit_type: string;
+  quantity_grams: number | null;
+  quantity_units: number | null;
+  display_qty: string;
+  previous_rate_paise: number;
+  current_rate_paise: number;
+  price_changed: boolean;
+  price_diff_paise: number;
+  is_available: boolean;
+  stock_warning?: string;
+}
+
+export interface RepeatOrderResponse {
+  hasOrder: boolean;
+  lastInvoice?: {
+    id: number;
+    invoice_number: string;
+    created_at: string;
+    total_paise: number;
+  };
+  items: RepeatOrderItem[];
+  warnings: string[];
 }
 
 

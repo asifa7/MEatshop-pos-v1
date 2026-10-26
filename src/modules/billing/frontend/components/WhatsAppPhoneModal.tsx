@@ -94,6 +94,12 @@ export const WhatsAppPhoneModal: React.FC<WhatsAppPhoneModalProps> = ({
         }
       }
 
+      if (!invoiceId) {
+        setError('No valid bill found to send. Please complete a bill first.');
+        setIsSending(false);
+        return;
+      }
+
       // Send WhatsApp bill directly in background
       const result = await window.api.invoke(IPC_CHANNELS.BILLING.SEND_WHATSAPP_BILL, {
         invoice_id: invoiceId,

@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "aistudio-pos",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

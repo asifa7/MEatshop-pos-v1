@@ -41,7 +41,7 @@ export const BusinessCardPreview: React.FC = () => {
               <Phone size={10} className="text-brand-500" /> Phone
             </p>
             <p className="font-bold text-text-primary font-mono text-[11px] truncate">
-              {shop.phone || '—'}
+              {shop.phone || ''}
             </p>
           </div>
 
@@ -59,7 +59,7 @@ export const BusinessCardPreview: React.FC = () => {
               <FileText size={10} className="text-brand-500" /> GSTIN
             </p>
             <p className="font-mono text-[11px] font-bold text-text-primary truncate">
-              {shop.gstin || 'Not Registered'}
+              {shop.gstin || ''}
             </p>
           </div>
 
@@ -68,7 +68,7 @@ export const BusinessCardPreview: React.FC = () => {
               <FileText size={10} className="text-brand-500" /> PAN
             </p>
             <p className="font-mono text-[11px] font-bold text-text-primary truncate">
-              {biz?.pan || '—'}
+              {biz?.pan || ''}
             </p>
           </div>
 

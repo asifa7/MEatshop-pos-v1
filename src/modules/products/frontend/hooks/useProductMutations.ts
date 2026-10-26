@@ -28,6 +28,11 @@ export function useCreateProduct() {
       rate_paise: number;
       cost_price_paise?: number;
       track_in_inventory?: number;
+      stock_mode?: 'OWN' | 'LINKED' | 'NONE';
+      parent_product_id?: number | null;
+      link_mode?: 'YIELD' | 'PACK' | null;
+      yield_g_per_kg?: number | null;
+      parent_units_per_sale_unit?: number | null;
     }) => {
       const res = await window.api.invoke(IPC_CHANNELS.PRODUCTS.CREATE, input);
       if (!res.success) throw new Error(res.error.message);
@@ -52,6 +57,11 @@ export function useUpdateProduct() {
         rate_paise?: number;
         cost_price_paise?: number;
         track_in_inventory?: number;
+        stock_mode?: 'OWN' | 'LINKED' | 'NONE';
+        parent_product_id?: number | null;
+        link_mode?: 'YIELD' | 'PACK' | null;
+        yield_g_per_kg?: number | null;
+        parent_units_per_sale_unit?: number | null;
       };
     }) => {
       const res = await window.api.invoke(IPC_CHANNELS.PRODUCTS.UPDATE, input);
@@ -249,6 +259,38 @@ export function useUpdateVariantYield() {
   return useMutation({
     mutationFn: async (input: { variant_id: number; parent_variant_id: number | null; yield_ratio: number | null }) => {
       const res = await window.api.invoke(IPC_CHANNELS.PRODUCTS.UPDATE_VARIANT_YIELD, input);
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateProductTracking() {
+  const invalidate = useInvalidateAll();
+  return useMutation({
+    mutationFn: async (input: { id: number; trackInInventory: boolean; reason?: string }) => {
+      const res = await window.api.invoke(IPC_CHANNELS.PRODUCTS.UPDATE_TRACKING_MODE, {
+        id: input.id,
+        trackInInventory: input.trackInInventory,
+        reason: input.reason || '',
+      });
+      if (!res.success) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: invalidate,
+  });
+}
+
+export function useBulkUpdateProductTracking() {
+  const invalidate = useInvalidateAll();
+  return useMutation({
+    mutationFn: async (input: { ids: number[]; trackInInventory: boolean; reason?: string }) => {
+      const res = await window.api.invoke(IPC_CHANNELS.PRODUCTS.BULK_UPDATE_TRACKING_MODE, {
+        ids: input.ids,
+        trackInInventory: input.trackInInventory,
+        reason: input.reason || '',
+      });
       if (!res.success) throw new Error(res.error.message);
       return res.data;
     },

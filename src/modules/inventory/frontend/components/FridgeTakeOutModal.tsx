@@ -45,8 +45,8 @@ export default function FridgeTakeOutModal({ item, onClose, onSuccess }: FridgeT
     else removalType = 'wastage';
 
     try {
-      const res: any = await removeMutation.mutateAsync({
-        batch_id: item.id || item.oldest_batch_id || item.batch_id || undefined,
+      const res: any = await (removeMutation.mutateAsync as any)({
+        batch_id: (item as any).id || (item as any).oldest_batch_id || (item as any).batch_id || undefined,
         product_variant_id: item.product_variant_id,
         quantity: qtyNum,
         unit_type: item.unit_type,

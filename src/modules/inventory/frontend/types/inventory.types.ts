@@ -21,6 +21,9 @@ export interface StockStatus {
   weighted_average_cost?: number;
   latest_purchase_rate_paise?: number | null;
   previous_purchase_rate_paise?: number | null;
+  track_in_inventory?: number;
+  is_inventory_tracked?: number;
+  stock_mode?: 'OWN' | 'LINKED' | 'NONE' | string;
 }
 
 export interface StockTransaction {

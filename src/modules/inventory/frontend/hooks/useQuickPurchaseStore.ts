@@ -12,10 +12,17 @@ export interface QuickPurchaseDraft {
   supplierId: string;
   receivedDate: string;
   billNumber: string;
+  supplierInvoiceNumber: string;
   billAmount: string;
   notes: string;
   billPhotoPath: string | null;
-  paymentMethod: 'cash' | 'credit';
+  paymentMethod: 'cash' | 'upi' | 'card' | 'credit' | 'partial';
+  paidAmount: string;
+  expectedPaymentDate: string;
+  discount: string;
+  tax: string;
+  freight: string;
+  otherCharges: string;
   editingInvoiceId: number | null;
   items: QuickPurchaseItemInput[];
 }
@@ -33,10 +40,17 @@ const initialDraft = (): QuickPurchaseDraft => ({
   supplierId: '',
   receivedDate: new Date().toISOString().split('T')[0],
   billNumber: '',
+  supplierInvoiceNumber: '',
   billAmount: '',
   notes: '',
   billPhotoPath: null,
   paymentMethod: 'credit',
+  paidAmount: '',
+  expectedPaymentDate: '',
+  discount: '',
+  tax: '',
+  freight: '',
+  otherCharges: '',
   editingInvoiceId: null,
   items: [],
 });
@@ -58,15 +72,19 @@ export const useQuickPurchaseStore = create<QuickPurchaseStore>((set, get) => ({
   resetDraft: () => set({ draft: initialDraft() }),
   hasUnsavedDraft: () => {
     const d = get().draft;
-    // Don't flag draft if we are just editing an existing invoice and haven't modified it,
-    // or flag if there are items entered.
     return !!(
       !d.editingInvoiceId && (
         d.supplierId ||
         d.billNumber ||
+        d.supplierInvoiceNumber ||
         d.billAmount ||
         d.notes ||
         d.billPhotoPath ||
+        d.paidAmount ||
+        d.discount ||
+        d.tax ||
+        d.freight ||
+        d.otherCharges ||
         d.items.length > 0
       )
     );
@@ -75,11 +93,18 @@ export const useQuickPurchaseStore = create<QuickPurchaseStore>((set, get) => ({
     draft: {
       supplierId: String(invoice.supplier_id),
       receivedDate: invoice.invoice_date,
-      billNumber: invoice.supplier_invoice_number,
+      billNumber: invoice.purchase_ref_number || '',
+      supplierInvoiceNumber: invoice.supplier_invoice_number || '',
       billAmount: String(invoice.total_amount_paise / 100),
       notes: invoice.notes || '',
       billPhotoPath: invoice.file_path || null,
-      paymentMethod: invoice.outstanding_amount_paise === 0 ? 'cash' : 'credit',
+      paymentMethod: invoice.outstanding_amount_paise === 0 ? 'cash' : (invoice.paid_amount_paise > 0 ? 'partial' : 'credit'),
+      paidAmount: invoice.paid_amount_paise ? String(invoice.paid_amount_paise / 100) : '',
+      expectedPaymentDate: invoice.expected_payment_date || '',
+      discount: invoice.discount_paise ? String(invoice.discount_paise / 100) : '',
+      tax: invoice.gst_paise ? String(invoice.gst_paise / 100) : '',
+      freight: invoice.freight_charges_paise ? String(invoice.freight_charges_paise / 100) : '',
+      otherCharges: invoice.other_charges_paise ? String(invoice.other_charges_paise / 100) : '',
       editingInvoiceId: invoice.id,
       items: items.map(item => ({
         product_variant_id: String(item.product_variant_id),

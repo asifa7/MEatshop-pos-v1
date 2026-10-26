@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { X, GitMerge, AlertTriangle, ArrowRight, Check, Search, User } from 'lucide-react';
+import { X, GitMerge, AlertTriangle, ArrowRight, Check, Search } from 'lucide-react';
 import { useMergeCustomers, useCustomers } from '../hooks/useCustomers';
 import { formatPaise, getCategoryBadgeColor } from '../types/customer.types';
 import type { Customer } from '../types/customer.types';

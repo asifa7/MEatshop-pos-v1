@@ -24,8 +24,26 @@ export interface ShiftClosingInput {
   sessionId: number;
   closingCashPaise: number;
   denominations?: Record<string, number>;
+  countedByMethod?: Record<string, number>; // method_key -> counted_paise
   declaredReason?: string;
   notes?: string;
+}
+
+export interface PaymentMethodConfigRow {
+  id: number;
+  method_key: string;
+  display_name: string;
+  method_type: string;
+  is_enabled: number;
+  sort_order: number;
+}
+
+export interface MethodExpectedBreakdown {
+  methodKey: string;
+  displayName: string;
+  methodType: string;
+  expectedPaise: number;
+  txCount: number;
 }
 
 export interface ShiftCorrectionInput {
@@ -48,10 +66,129 @@ export interface ShiftHistoryFilter {
   offset?: number;
 }
 
+/**
+ * Normalizes SQLite UTC timestamps ("YYYY-MM-DD HH:MM:SS") into valid ISO-8601 UTC strings
+ * so JavaScript Date always converts accurately to local time (IST).
+ */
+export function normalizeSqliteTimestamp(ts?: string | null): string | null {
+  if (!ts) return null;
+  const trimmed = String(ts).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(trimmed)) {
+    return trimmed.replace(' ', 'T') + 'Z';
+  }
+  return trimmed;
+}
+
+export function isShiftFromPreviousDay(openedAt?: string | null): boolean {
+  const norm = normalizeSqliteTimestamp(openedAt);
+  if (!norm) return false;
+  const openedDate = new Date(norm);
+  if (isNaN(openedDate.getTime())) return false;
+  const now = new Date();
+  return (
+    openedDate.getFullYear() !== now.getFullYear() ||
+    openedDate.getMonth() !== now.getMonth() ||
+    openedDate.getDate() !== now.getDate()
+  );
+}
+
 export class CashBoxService {
+  public getPaymentMethods(includeDisabled = false): PaymentMethodConfigRow[] {
+    try {
+      const sql = includeDisabled
+        ? 'SELECT * FROM payment_methods_config ORDER BY sort_order ASC, id ASC'
+        : 'SELECT * FROM payment_methods_config WHERE is_enabled = 1 ORDER BY sort_order ASC, id ASC';
+      const rows = db.prepare(sql).all() as PaymentMethodConfigRow[];
+      if (rows.length > 0) return rows;
+    } catch {
+      // Fallback if table not migrated yet
+    }
+    return [
+      { id: 1, method_key: 'cash', display_name: 'Cash', method_type: 'CASH', is_enabled: 1, sort_order: 1 },
+      { id: 2, method_key: 'paytm', display_name: 'Paytm', method_type: 'UPI', is_enabled: 1, sort_order: 2 },
+      { id: 3, method_key: 'gpay', display_name: 'Google Pay', method_type: 'UPI', is_enabled: 1, sort_order: 3 },
+      { id: 4, method_key: 'phonepe', display_name: 'PhonePe', method_type: 'UPI', is_enabled: 1, sort_order: 4 },
+      { id: 5, method_key: 'card', display_name: 'Card', method_type: 'CARD', is_enabled: 1, sort_order: 5 },
+      { id: 6, method_key: 'other', display_name: 'Other', method_type: 'OTHER', is_enabled: 1, sort_order: 6 },
+    ];
+  }
+
+  public savePaymentMethod(input: {
+    id?: number;
+    method_key?: string;
+    display_name: string;
+    method_type?: string;
+    is_enabled?: boolean | number;
+    sort_order?: number;
+  }): PaymentMethodConfigRow[] {
+    const cleanName = (input.display_name || '').trim();
+    if (!cleanName) throw new Error('Payment method name is required');
+    const enabledInt = input.is_enabled === undefined ? 1 : input.is_enabled ? 1 : 0;
+    const methodType = (input.method_type || 'OTHER').toUpperCase();
+
+    if (input.id) {
+      db.prepare(`
+        UPDATE payment_methods_config
+        SET display_name = ?, method_type = COALESCE(?, method_type), is_enabled = ?, sort_order = COALESCE(?, sort_order), updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(cleanName, methodType, enabledInt, input.sort_order ?? null, input.id);
+    } else {
+      const key = (input.method_key || cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '_')).replace(/^_+|_+$/g, '') || `method_${Date.now()}`;
+      const maxOrderRow = db.prepare('SELECT COALESCE(MAX(sort_order), 0) as max_order FROM payment_methods_config').get() as { max_order: number };
+      db.prepare(`
+        INSERT INTO payment_methods_config (method_key, display_name, method_type, is_enabled, sort_order)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(method_key) DO UPDATE SET
+          display_name = excluded.display_name,
+          method_type = excluded.method_type,
+          is_enabled = excluded.is_enabled,
+          updated_at = CURRENT_TIMESTAMP
+      `).run(key, cleanName, methodType, enabledInt, input.sort_order ?? ((maxOrderRow?.max_order || 0) + 1));
+    }
+
+    return this.getPaymentMethods(true);
+  }
+
+  public getLastClosedShiftSummary(): {
+    previousSessionId: number | null;
+    previousClosingCashPaise: number;
+    previousClosedAt: string | null;
+    previousCashierName: string | null;
+  } {
+    const row = db.prepare(`
+      SELECT 
+        ps.id as session_id,
+        COALESCE(scr.physical_cash_paise, ps.closing_cash_paise, 0) as closing_cash_paise,
+        COALESCE(scr.closed_at, ps.closed_at) as closed_at,
+        COALESCE(u.full_name, u.username, 'Cashier #' || ps.cashier_id) as cashier_name
+      FROM pos_sessions ps
+      LEFT JOIN shift_closing_records scr ON scr.session_id = ps.id
+      LEFT JOIN users u ON u.id = ps.cashier_id
+      WHERE ps.status = 'Closed'
+      ORDER BY ps.id DESC
+      LIMIT 1
+    `).get() as { session_id: number; closing_cash_paise: number; closed_at: string | null; cashier_name: string } | undefined;
+
+    if (!row) {
+      return {
+        previousSessionId: null,
+        previousClosingCashPaise: 0,
+        previousClosedAt: null,
+        previousCashierName: null,
+      };
+    }
+
+    return {
+      previousSessionId: row.session_id,
+      previousClosingCashPaise: row.closing_cash_paise || 0,
+      previousClosedAt: normalizeSqliteTimestamp(row.closed_at),
+      previousCashierName: row.cashier_name,
+    };
+  }
+
   /**
    * Calculates live expected cash from the unified formula:
-   * Expected = Opening Float + Cash Sales + Cash In - Cash Expenses - Cash Refunds - Cash Out
+   * Expected = Opening Float + Cash Sales (completed invoices only) + Cash In - Cash Expenses - Cash Refunds - Cash Out
    */
   public calculateExpectedCash(sessionId: number): {
     openingCashPaise: number;
@@ -77,11 +214,15 @@ export class CashBoxService {
 
     const openingCashPaise = session.opening_cash_paise || 0;
 
-    // 1. Cash Sales from store_cash_box
+    // 1. Cash Sales from store_cash_box - strictly verified against completed non-void invoices
     const salesRow = db.prepare(`
-      SELECT COALESCE(SUM(amount_paise), 0) as total
-      FROM store_cash_box
-      WHERE session_id = ? AND type = 'CASH_SALE' AND is_active = 1
+      SELECT COALESCE(SUM(scb.amount_paise), 0) as total
+      FROM store_cash_box scb
+      LEFT JOIN invoices i ON i.id = scb.invoice_id
+      WHERE scb.session_id = ?
+        AND scb.type = 'CASH_SALE'
+        AND scb.is_active = 1
+        AND (scb.invoice_id IS NULL OR i.status = 'completed')
     `).get(sessionId) as { total: number };
     const cashSalesPaise = salesRow?.total || 0;
 
@@ -93,7 +234,7 @@ export class CashBoxService {
     `).get(sessionId) as { total: number };
     const cashInPaise = cashInRow?.total || 0;
 
-    // 3. Cash Expenses from shift_cash_movements (and store_cash_box CASH_EXPENSE)
+    // 3. Cash Expenses from shift_cash_movements
     const expenseRow = db.prepare(`
       SELECT COALESCE(SUM(amount_paise), 0) as total
       FROM shift_cash_movements
@@ -109,7 +250,7 @@ export class CashBoxService {
     `).get(sessionId) as { total: number };
     const cashRefundsPaise = refundRow?.total || 0;
 
-    // 5. Cash Out from shift_cash_movements (and withdrawals)
+    // 5. Cash Out from shift_cash_movements (and supplier cash payments in store_cash_box not in shift_cash_movements)
     const cashOutRow = db.prepare(`
       SELECT COALESCE(SUM(amount_paise), 0) as total
       FROM shift_cash_movements
@@ -131,7 +272,7 @@ export class CashBoxService {
   }
 
   /**
-   * Computes Non-Cash sales summary for a session (UPI, Card, Credit)
+   * Computes Non-Cash sales summary AND per-payment-method expected breakdown for a session
    */
   public calculateNonCashSummary(sessionId: number): {
     upiSalesPaise: number;
@@ -141,26 +282,50 @@ export class CashBoxService {
     creditSalesPaise: number;
     creditCount: number;
     totalNonCashPaise: number;
+    expectedByMethod: MethodExpectedBreakdown[];
   } {
     const session = db.prepare('SELECT * FROM pos_sessions WHERE id = ?').get(sessionId) as PosSession | undefined;
-    if (!session) {
-      return { upiSalesPaise: 0, upiCount: 0, cardSalesPaise: 0, cardCount: 0, creditSalesPaise: 0, creditCount: 0, totalNonCashPaise: 0 };
+    const configuredMethods = this.getPaymentMethods(false);
+    const expectedCash = session ? this.calculateExpectedCash(sessionId).expectedCashPaise : 0;
+
+    const methodMap = new Map<string, MethodExpectedBreakdown>();
+    for (const m of configuredMethods) {
+      methodMap.set(m.method_key, {
+        methodKey: m.method_key,
+        displayName: m.display_name,
+        methodType: m.method_type,
+        expectedPaise: m.method_key === 'cash' ? expectedCash : 0,
+        txCount: 0,
+      });
     }
 
-    const timeClause = session.closed_at 
-      ? 'AND (i.completed_at >= ? AND i.completed_at <= ?)' 
-      : 'AND i.completed_at >= ?';
-    const params = session.closed_at 
-      ? [session.cashier_id, session.opened_at, session.closed_at] 
-      : [session.cashier_id, session.opened_at];
+    if (!session) {
+      return {
+        upiSalesPaise: 0,
+        upiCount: 0,
+        cardSalesPaise: 0,
+        cardCount: 0,
+        creditSalesPaise: 0,
+        creditCount: 0,
+        totalNonCashPaise: 0,
+        expectedByMethod: Array.from(methodMap.values()),
+      };
+    }
+
+    const timeClause = session.closed_at
+      ? 'AND (datetime(i.completed_at) >= datetime(?) AND datetime(i.completed_at) <= datetime(?))'
+      : 'AND datetime(i.completed_at) >= datetime(?)';
+    const params = session.closed_at
+      ? [session.opened_at, session.closed_at]
+      : [session.opened_at];
 
     const payments = db.prepare(`
-      SELECT p.method, COALESCE(SUM(p.amount_paise), 0) as total, COUNT(p.id) as count
+      SELECT p.method, p.reference, COALESCE(SUM(p.amount_paise), 0) as total, COUNT(p.id) as count
       FROM payments p
       JOIN invoices i ON i.id = p.invoice_id
-      WHERE i.status = 'completed' AND i.created_by = ? ${timeClause}
-      GROUP BY p.method
-    `).all(...params) as Array<{ method: string; total: number; count: number }>;
+      WHERE i.status = 'completed' ${timeClause}
+      GROUP BY p.method, p.reference
+    `).all(...params) as Array<{ method: string; reference: string | null; total: number; count: number }>;
 
     let upiSalesPaise = 0, upiCount = 0;
     let cardSalesPaise = 0, cardCount = 0;
@@ -168,15 +333,50 @@ export class CashBoxService {
 
     payments.forEach(p => {
       const m = (p.method || '').toLowerCase();
-      if (m.includes('upi') || m.includes('qr') || m.includes('gpay') || m.includes('phonepe') || m.includes('paytm')) {
-        upiSalesPaise += p.total;
-        upiCount += p.count;
-      } else if (m.includes('card') || m.includes('pos') || m.includes('debit') || m.includes('credit_card')) {
-        cardSalesPaise += p.total;
-        cardCount += p.count;
-      } else if (m.includes('credit') || m.includes('ar') || m.includes('customer')) {
+      const ref = (p.reference || '').toLowerCase();
+      const combined = `${m} ${ref}`;
+
+      if (m === 'cash') {
+        const cashEntry = methodMap.get('cash');
+        if (cashEntry) cashEntry.txCount += p.count;
+        return;
+      }
+
+      if (m.includes('credit') || m.includes('ar') || m.includes('customer') || m.includes('udhaar')) {
         creditSalesPaise += p.total;
         creditCount += p.count;
+        return;
+      }
+
+      if (combined.includes('paytm')) {
+        upiSalesPaise += p.total;
+        upiCount += p.count;
+        const target = methodMap.get('paytm') || methodMap.get('other');
+        if (target) { target.expectedPaise += p.total; target.txCount += p.count; }
+      } else if (combined.includes('gpay') || combined.includes('google')) {
+        upiSalesPaise += p.total;
+        upiCount += p.count;
+        const target = methodMap.get('gpay') || methodMap.get('other');
+        if (target) { target.expectedPaise += p.total; target.txCount += p.count; }
+      } else if (combined.includes('phonepe')) {
+        upiSalesPaise += p.total;
+        upiCount += p.count;
+        const target = methodMap.get('phonepe') || methodMap.get('other');
+        if (target) { target.expectedPaise += p.total; target.txCount += p.count; }
+      } else if (m.includes('upi') || m.includes('qr')) {
+        upiSalesPaise += p.total;
+        upiCount += p.count;
+        // Check if custom method matches `m`, otherwise put in gpay/phonepe/paytm or other
+        const exact = methodMap.get(m) || methodMap.get('gpay') || methodMap.get('phonepe') || methodMap.get('paytm') || methodMap.get('other');
+        if (exact) { exact.expectedPaise += p.total; exact.txCount += p.count; }
+      } else if (m.includes('card') || m.includes('pos') || m.includes('debit') || m.includes('swipe')) {
+        cardSalesPaise += p.total;
+        cardCount += p.count;
+        const target = methodMap.get('card') || methodMap.get('other');
+        if (target) { target.expectedPaise += p.total; target.txCount += p.count; }
+      } else {
+        const custom = methodMap.get(m) || methodMap.get('other');
+        if (custom) { custom.expectedPaise += p.total; custom.txCount += p.count; }
       }
     });
 
@@ -188,40 +388,96 @@ export class CashBoxService {
       creditSalesPaise,
       creditCount,
       totalNonCashPaise: upiSalesPaise + cardSalesPaise + creditSalesPaise,
+      expectedByMethod: Array.from(methodMap.values()),
     };
   }
 
-  public getCurrentSession(): PosSession | null {
+  public getCurrentSession(): (PosSession & {
+    opened_at_iso?: string | null;
+    is_stale_previous_day?: boolean;
+    previous_closing_cash_paise?: number;
+    previous_session_id?: number | null;
+    previous_closed_at?: string | null;
+  }) | null {
     const cashierId = authService.getCurrentUserId();
-    return (db.prepare("SELECT * FROM pos_sessions WHERE cashier_id = ? AND status = 'Open' ORDER BY id DESC LIMIT 1").get(cashierId) as PosSession) || null;
+    let session = (db.prepare("SELECT * FROM pos_sessions WHERE cashier_id = ? AND status = 'Open' ORDER BY id DESC LIMIT 1").get(cashierId) as PosSession | undefined) || null;
+    if (!session) {
+      session = (db.prepare("SELECT * FROM pos_sessions WHERE status = 'Open' ORDER BY id DESC LIMIT 1").get() as PosSession | undefined) || null;
+    }
+    if (!session) return null;
+
+    const prev = this.getLastClosedShiftSummary();
+    const openedIso = normalizeSqliteTimestamp(session.opened_at);
+    return {
+      ...session,
+      opened_at: openedIso || session.opened_at,
+      opened_at_iso: openedIso,
+      is_stale_previous_day: isShiftFromPreviousDay(session.opened_at),
+      previous_closing_cash_paise: prev.previousClosingCashPaise,
+      previous_session_id: prev.previousSessionId,
+      previous_closed_at: prev.previousClosedAt,
+    };
   }
 
-  public openSession(openingCashPaise: number, denominations?: Record<string, number>): PosSession {
+  public openSession(
+    openingCashPaise: number,
+    denominations?: Record<string, number>,
+    openingVarianceReason?: string
+  ): PosSession {
     const cashierId = authService.getCurrentUserId();
     const existing = this.getCurrentSession();
     if (existing) return existing;
 
     if (!Number.isSafeInteger(openingCashPaise) || openingCashPaise < 0) throw new Error('Invalid opening cash float');
-    
+
+    const prev = this.getLastClosedShiftSummary();
+    const diffFromPrev = prev.previousSessionId !== null ? openingCashPaise - prev.previousClosingCashPaise : 0;
+    if (prev.previousSessionId !== null && diffFromPrev !== 0 && !openingVarianceReason?.trim()) {
+      throw new Error(
+        `Opening cash (₹${(openingCashPaise / 100).toFixed(2)}) does not match previous shift #${prev.previousSessionId} closing cash (₹${(prev.previousClosingCashPaise / 100).toFixed(2)}). A reason is required.`
+      );
+    }
+
+    const nowIso = new Date().toISOString();
+    const openingNote =
+      prev.previousSessionId !== null && diffFromPrev !== 0
+        ? `Opening cash variance vs Shift #${prev.previousSessionId} (${diffFromPrev > 0 ? '+' : ''}₹${(diffFromPrev / 100).toFixed(2)}): ${openingVarianceReason?.trim()}`
+        : null;
+
     return db.transaction(() => {
       const result = db.prepare(`
-        INSERT INTO pos_sessions (store_id, cashier_id, opening_cash_paise, opening_denominations_json, status, created_by)
-        VALUES (1, ?, ?, ?, 'Open', ?)
-      `).run(cashierId, openingCashPaise, JSON.stringify(denominations ?? {}), cashierId);
-      
+        INSERT INTO pos_sessions (store_id, cashier_id, opened_at, opening_cash_paise, opening_denominations_json, status, notes, created_by)
+        VALUES (1, ?, ?, ?, ?, 'Open', ?, ?)
+      `).run(cashierId, nowIso, openingCashPaise, JSON.stringify(denominations ?? {}), openingNote, cashierId);
+
       const sessionId = Number(result.lastInsertRowid);
 
-      if (openingCashPaise > 0) {
+      if (openingCashPaise > 0 || prev.previousSessionId !== null) {
         db.prepare(`
           INSERT INTO store_cash_box
           (store_id, session_id, type, direction, amount_paise, category, reason, denomination_snapshot_json, expected_before_paise, expected_after_paise, performed_by, created_by)
-          VALUES (1, ?, 'OPENING_BALANCE', 'IN', ?, 'Opening float', 'Counted opening cash', ?, 0, ?, ?, ?)
-        `).run(sessionId, openingCashPaise, JSON.stringify(denominations ?? {}), openingCashPaise, cashierId, cashierId);
+          VALUES (1, ?, 'OPENING_BALANCE', 'IN', ?, 'Opening float', ?, ?, ?, ?, ?, ?)
+        `).run(
+          sessionId,
+          openingCashPaise,
+          openingNote || 'Counted opening cash (tallied with previous shift)',
+          JSON.stringify(denominations ?? {}),
+          prev.previousClosingCashPaise,
+          openingCashPaise,
+          cashierId,
+          cashierId
+        );
       }
 
-      auditLogger.log(cashierId, 'CASHBOX_OPEN_SESSION', { sessionId, openingCashPaise });
-      logger.info('POS shift session opened', { cashierId, sessionId, openingCashPaise });
-      return db.prepare('SELECT * FROM pos_sessions WHERE id = ?').get(sessionId) as PosSession;
+      auditLogger.log(cashierId, 'CASHBOX_OPEN_SESSION', {
+        sessionId,
+        openingCashPaise,
+        previousClosingCashPaise: prev.previousClosingCashPaise,
+        diffFromPrev,
+        openingVarianceReason,
+      });
+      logger.info('POS shift session opened', { cashierId, sessionId, openingCashPaise, diffFromPrev });
+      return this.getCurrentSession() as PosSession;
     })();
   }
 
@@ -425,15 +681,34 @@ export class CashBoxService {
     const calculation = this.calculateExpectedCash(input.sessionId);
     const expectedCashPaise = calculation.expectedCashPaise;
     const differencePaise = input.closingCashPaise - expectedCashPaise;
-    const isMatched = differencePaise === 0;
-
-    if (!isMatched && !input.declaredReason?.trim()) {
-      throw new Error('A declared reason is strictly required when counted physical cash differs from expected cash');
-    }
 
     const nonCash = this.calculateNonCashSummary(input.sessionId);
+    const countedMap = input.countedByMethod || {};
+    const methodReconciliation = nonCash.expectedByMethod.map(m => {
+      const countedPaise = m.methodKey === 'cash'
+        ? input.closingCashPaise
+        : Math.max(0, Math.round(Number(countedMap[m.methodKey] ?? m.expectedPaise)));
+      const diffPaise = countedPaise - m.expectedPaise;
+      return {
+        ...m,
+        countedPaise,
+        differencePaise: diffPaise,
+      };
+    });
+
+    const anyMethodMismatch = methodReconciliation.some(m => m.differencePaise !== 0);
+    const isMatched = differencePaise === 0 && !anyMethodMismatch;
+
+    if (!isMatched && !input.declaredReason?.trim()) {
+      throw new Error('A declared reason is strictly required when counted cash or payment method totals differ from expected');
+    }
+
     const closingStatus = isMatched ? 'matched' : 'explained_difference';
     const now = new Date().toISOString();
+    const fullNonCashPayload = {
+      ...nonCash,
+      methodReconciliation,
+    };
 
     return db.transaction(() => {
       // 1. Insert or Replace Shift Closing Record
@@ -461,21 +736,22 @@ export class CashBoxService {
         closingStatus,
         input.declaredReason?.trim() || null,
         JSON.stringify(input.denominations ?? {}),
-        JSON.stringify(nonCash),
+        JSON.stringify(fullNonCashPayload),
         cashierId,
         now,
         input.notes?.trim() || null
       );
 
-      // 2. Update pos_sessions
+      // 2. Update pos_sessions (including payment_methods_breakdown_json)
       db.prepare(`
         UPDATE pos_sessions
-        SET closed_at = ?, closing_cash_paise = ?, closing_denominations_json = ?, expected_cash_paise = ?, variance_paise = ?, variance_reason = ?, status = 'Closed', notes = ?, updated_at = CURRENT_TIMESTAMP
+        SET closed_at = ?, closing_cash_paise = ?, closing_denominations_json = ?, payment_methods_breakdown_json = ?, expected_cash_paise = ?, variance_paise = ?, variance_reason = ?, status = 'Closed', notes = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).run(
         now,
         input.closingCashPaise,
         JSON.stringify(input.denominations ?? {}),
+        JSON.stringify(methodReconciliation),
         expectedCashPaise,
         differencePaise,
         input.declaredReason?.trim() || null,
@@ -489,6 +765,7 @@ export class CashBoxService {
         expectedCashPaise,
         differencePaise,
         closingStatus,
+        methodReconciliation,
       });
 
       logger.info('POS shift session successfully closed and locked', {
@@ -559,7 +836,15 @@ export class CashBoxService {
         ps.status,
         COALESCE(scr.status, ps.status) as reconciliation_status,
         ps.opening_cash_paise,
-        COALESCE((SELECT SUM(amount_paise) FROM store_cash_box WHERE session_id = ps.id AND type = 'CASH_SALE' AND is_active = 1), 0) as cash_sales_paise,
+        COALESCE((
+          SELECT SUM(scb.amount_paise)
+          FROM store_cash_box scb
+          LEFT JOIN invoices i ON i.id = scb.invoice_id
+          WHERE scb.session_id = ps.id
+            AND scb.type = 'CASH_SALE'
+            AND scb.is_active = 1
+            AND (scb.invoice_id IS NULL OR i.status = 'completed')
+        ), 0) as cash_sales_paise,
         COALESCE((SELECT SUM(amount_paise) FROM shift_cash_movements WHERE session_id = ps.id AND movement_type = 'cash_in' AND is_active = 1), 0) as cash_in_paise,
         COALESCE((SELECT SUM(amount_paise) FROM shift_cash_movements WHERE session_id = ps.id AND movement_type = 'expense' AND is_active = 1), 0) as cash_expenses_paise,
         COALESCE((SELECT SUM(amount_paise) FROM store_cash_box WHERE session_id = ps.id AND type = 'CASH_REFUND' AND is_active = 1), 0) as cash_refunds_paise,
@@ -577,7 +862,13 @@ export class CashBoxService {
       LIMIT ? OFFSET ?
     `).all(...params, limit, offset) as ShiftSummaryItem[];
 
-    return { shifts: rows, total: countRow?.total || 0 };
+    const normalizedRows = rows.map(r => ({
+      ...r,
+      opened_at: normalizeSqliteTimestamp(r.opened_at) || r.opened_at,
+      closed_at: normalizeSqliteTimestamp(r.closed_at) || r.closed_at,
+    }));
+
+    return { shifts: normalizedRows, total: countRow?.total || 0 };
   }
 
   /**
@@ -591,6 +882,9 @@ export class CashBoxService {
       WHERE ps.id = ?
     `).get(sessionId) as any;
     if (!session) throw new Error(`Shift #${sessionId} not found`);
+
+    session.opened_at = normalizeSqliteTimestamp(session.opened_at) || session.opened_at;
+    session.closed_at = normalizeSqliteTimestamp(session.closed_at) || session.closed_at;
 
     const closingRecord = db.prepare(`
       SELECT scr.*, COALESCE(u.full_name, u.username) as closed_by_name
@@ -756,45 +1050,66 @@ export class CashBoxService {
    * Inspection view: all shift transactions for Cashier Check View during shift closing
    */
   public getShiftTransactions(sessionId: number) {
-    return db.prepare(`
+    const rows = db.prepare(`
       SELECT 
-        id,
-        type,
-        direction,
-        amount_paise,
-        category,
-        reason,
-        reference_type,
-        reference_id,
-        invoice_id,
-        created_at,
-        CASE WHEN direction = 'IN' THEN amount_paise ELSE 0 END as cash_in_paise,
-        CASE WHEN direction = 'OUT' THEN amount_paise ELSE 0 END as cash_out_paise
-      FROM store_cash_box
-      WHERE session_id = ? AND is_active = 1
-      ORDER BY created_at DESC, id DESC
-    `).all(sessionId);
+        scb.id,
+        scb.type,
+        scb.direction,
+        scb.amount_paise,
+        scb.category,
+        scb.reason,
+        scb.reference_type,
+        scb.reference_id,
+        scb.invoice_id,
+        scb.created_at,
+        CASE WHEN scb.direction = 'IN' THEN scb.amount_paise ELSE 0 END as cash_in_paise,
+        CASE WHEN scb.direction = 'OUT' THEN scb.amount_paise ELSE 0 END as cash_out_paise
+      FROM store_cash_box scb
+      LEFT JOIN invoices i ON i.id = scb.invoice_id
+      WHERE scb.session_id = ?
+        AND scb.is_active = 1
+        AND (scb.invoice_id IS NULL OR i.status = 'completed')
+      ORDER BY scb.created_at DESC, scb.id DESC
+    `).all(sessionId) as any[];
+    return rows.map(r => ({
+      ...r,
+      created_at: normalizeSqliteTimestamp(r.created_at) || r.created_at,
+    }));
   }
 
   /**
    * Dashboard & Legacy compatibility wrappers
    */
   public getDashboard(sessionId?: number) {
+    const prevSummary = this.getLastClosedShiftSummary();
+    const paymentMethods = this.getPaymentMethods(false);
     const session: PosSession | null = sessionId
       ? (db.prepare('SELECT * FROM pos_sessions WHERE id = ?').get(sessionId) as PosSession | undefined) ?? null
       : this.getCurrentSession();
     if (!session) return null;
 
+    const normalizedOpenedAt = normalizeSqliteTimestamp(session.opened_at) || session.opened_at;
+    const isStaleShift = session.status === 'Open' && isShiftFromPreviousDay(session.opened_at);
     const expected = this.calculateExpectedCash(session.id);
     const nonCash = this.calculateNonCashSummary(session.id);
-    const recentMovements = db.prepare(`
+    const recentMovements = (db.prepare(`
       SELECT * FROM shift_cash_movements
       WHERE session_id = ? AND is_active = 1
       ORDER BY created_at DESC LIMIT 20
-    `).all(session.id) as ShiftCashMovement[];
+    `).all(session.id) as ShiftCashMovement[]).map(m => ({
+      ...m,
+      created_at: normalizeSqliteTimestamp(m.created_at) || m.created_at,
+    }));
 
     return {
-      session,
+      session: {
+        ...session,
+        opened_at: normalizedOpenedAt,
+        is_stale_previous_day: isStaleShift,
+      },
+      isStaleShift,
+      previousShiftSummary: prevSummary,
+      paymentMethods,
       expectedCashPaise: expected.expectedCashPaise,
       calculation: expected,
       nonCashSummary: nonCash,

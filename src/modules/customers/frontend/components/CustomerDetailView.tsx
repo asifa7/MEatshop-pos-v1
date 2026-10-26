@@ -15,7 +15,9 @@ import {
   useCustomerActivityLog, 
   useCustomerPurchaseHistory, 
   useCustomerOverviewSummary,
-  useCustomerIntelligence 
+  useCustomerIntelligence,
+  useUpdateCustomerConsent,
+  useSetManualCustomerTier
 } from '../hooks/useCustomers';
 import { useCustomerAddresses, useDeliveries, useSaveCustomerAddress } from '../../../delivery/frontend/hooks/useDelivery';
 import AddressMapPickerModal from '../../../delivery/frontend/components/AddressMapPickerModal';
@@ -39,7 +41,7 @@ interface CustomerDetailViewProps {
   onEdit: (customer: Customer) => void;
 }
 
-type Tab = 'overview' | 'purchases' | 'deliveries' | 'behavior' | 'ledger' | 'payments' | 'credit_notes' | 'reminders' | 'activity';
+type Tab = 'overview' | 'purchases' | 'visits' | 'behavior' | 'payments' | 'ledger' | 'notes' | 'reminders' | 'credit_notes' | 'consent' | 'deliveries' | 'activity';
 
 export default function CustomerDetailView({ 
   customer, 
@@ -91,6 +93,20 @@ export default function CustomerDetailView({
   const freezeCredit = useFreezeCredit();
   const unfreezeCredit = useUnfreezeCredit();
   const createReminder = useCreateReminder();
+  const updateConsentMutation = useUpdateCustomerConsent();
+  const setManualTierMutation = useSetManualCustomerTier();
+
+  const handleToggleConsent = async (field: 'whatsapp_bill_consent' | 'marketing_consent', value: number) => {
+    try {
+      await updateConsentMutation.mutateAsync({
+        customer_id: customer.id,
+        [field]: value,
+      });
+      customer[field] = value;
+    } catch (err) {
+      console.error('Failed to update consent:', err);
+    }
+  };
 
   const handleSaveAddress = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -187,6 +203,66 @@ export default function CustomerDetailView({
             <p className="text-[11px] text-text-secondary mt-0.5 font-mono">
               {customer.customer_code} {customer.phone ? `• ${customer.phone}` : ''} {customer.whatsapp && customer.whatsapp !== customer.phone ? `(WA: ${customer.whatsapp})` : ''}
             </p>
+
+            {/* Quick Tier & Time Habit Selector */}
+            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-text-muted font-bold">Tier:</span>
+                <select
+                  value={customer.manual_tier || 'auto'}
+                  onChange={async (e) => {
+                    const val = e.target.value;
+                    try {
+                      await setManualTierMutation.mutateAsync({
+                        customer_id: customer.id,
+                        tier: val === 'auto' ? null : val,
+                        preferred_time_slot: customer.preferred_time_slot,
+                      });
+                      customer.manual_tier = val === 'auto' ? null : val;
+                      refetchIntelligence();
+                    } catch (err: any) {
+                      alert(`Error setting tier: ${err?.message || err}`);
+                    }
+                  }}
+                  className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg border border-border-subtle bg-surface-card hover:border-amber-400 cursor-pointer outline-none text-text-primary"
+                >
+                  <option value="auto">Auto (Criteria)</option>
+                  <option value="vip">⭐ VIP</option>
+                  <option value="regular">🟢 Regular</option>
+                  <option value="new">🆕 New</option>
+                  <option value="rare">⏳ Rare</option>
+                  <option value="wholesale">📦 Wholesale</option>
+                  <option value="restaurant">🍽️ Restaurant</option>
+                </select>
+              </div>
+
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-text-muted font-bold">Usual Time:</span>
+                <select
+                  value={customer.preferred_time_slot || 'flexible'}
+                  onChange={async (e) => {
+                    const val = e.target.value;
+                    try {
+                      await setManualTierMutation.mutateAsync({
+                        customer_id: customer.id,
+                        tier: customer.manual_tier || null,
+                        preferred_time_slot: val === 'flexible' ? null : val,
+                      });
+                      customer.preferred_time_slot = val === 'flexible' ? null : val;
+                      refetchIntelligence();
+                    } catch (err: any) {
+                      alert(`Error setting time preference: ${err?.message || err}`);
+                    }
+                  }}
+                  className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg border border-border-subtle bg-surface-card hover:border-amber-400 cursor-pointer outline-none text-text-primary"
+                >
+                  <option value="flexible">Auto Habit</option>
+                  <option value="morning">🌅 Morning (6 AM - 12 PM)</option>
+                  <option value="afternoon">☀️ Afternoon (12 PM - 5 PM)</option>
+                  <option value="evening">🌙 Evening (5 PM+)</option>
+                </select>
+              </div>
+            </div>
           </div>
         </div>
         
@@ -202,9 +278,21 @@ export default function CustomerDetailView({
               Blacklisted
             </span>
           )}
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              onEdit(customer);
+            }}
+            className="px-3 py-1.5 bg-brand-500 hover:bg-brand-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all hover:scale-105 active:scale-95 cursor-pointer"
+            title="Edit Customer Profile"
+          >
+            <Edit3 size={13} />
+            <span>Edit Customer</span>
+          </button>
           <button 
             onClick={onClose} 
-            className="p-1.5 hover:bg-surface-hover rounded-xl text-text-secondary hover:text-text-primary transition-colors"
+            className="p-1.5 hover:bg-surface-hover rounded-xl text-text-secondary hover:text-text-primary transition-colors cursor-pointer"
           >
             <X size={18} />
           </button>
@@ -240,12 +328,11 @@ export default function CustomerDetailView({
         {[
           { id: 'overview', label: 'Overview' },
           { id: 'purchases', label: `Purchases (${purchaseData?.total_count ?? 0})` },
-          { id: 'deliveries', label: `Deliveries & Addresses (${customerDeliveries.length})` },
-          { id: 'behavior', label: 'Behavior & Intelligence', highlight: true },
-          { id: 'ledger', label: 'Ledger DR/CR' },
-          { id: 'payments', label: 'Payments' },
-          { id: 'credit_notes', label: 'Credit Notes' },
-          { id: 'reminders', label: 'Reminders' },
+          { id: 'visits', label: `Visits & Habits (${intelligence?.total_visits ?? 0})`, highlight: true },
+          { id: 'payments', label: 'Payments & Ledger' },
+          { id: 'notes', label: `Notes & Reminders (${(reminders?.length ?? 0) + (creditNotes?.length ?? 0)})` },
+          { id: 'consent', label: 'Consent & Privacy' },
+          { id: 'deliveries', label: `Deliveries (${customerDeliveries.length})` },
           { id: 'activity', label: 'Activity' },
         ].map((t) => (
           <button
@@ -743,8 +830,8 @@ export default function CustomerDetailView({
           </div>
         )}
 
-        {/* TAB 3: BEHAVIOR & INTELLIGENCE (Phase 2 Core Engine) */}
-        {activeTab === 'behavior' && (
+        {/* TAB 3: VISITS & HABITS INTELLIGENCE */}
+        {(activeTab === 'visits' || activeTab === 'behavior') && (
           <div className="space-y-6">
             {intelligence ? (
               <>
@@ -935,19 +1022,17 @@ export default function CustomerDetailView({
           </div>
         )}
 
-        {/* TAB 4: LEDGER */}
-        {activeTab === 'ledger' && (
-          <LedgerView customerId={customer.id} customerName={customer.name} />
-        )}
-
-        {/* TAB 5: PAYMENTS */}
-        {activeTab === 'payments' && (
+        {/* TAB 4: PAYMENTS & LEDGER */}
+        {(activeTab === 'payments' || activeTab === 'ledger') && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <h4 className="font-extrabold text-text-primary text-xs">Direct Payments & Receipts</h4>
+              <div>
+                <h4 className="font-extrabold text-text-primary text-xs">Direct Payments & Credit Ledger</h4>
+                <p className="text-[10px] text-text-muted mt-0.5">Complete chronological debit & credit movements with running balance</p>
+              </div>
               <button
                 onClick={() => setIsPaymentOpen(true)}
-                className="btn-primary text-[10px] px-3 py-1.5 flex items-center gap-1.5 font-bold"
+                className="btn-primary text-[10px] px-3.5 py-2 flex items-center gap-1.5 font-bold shadow-sm"
               >
                 <Banknote size={14} /> Record Payment
               </button>
@@ -956,85 +1041,184 @@ export default function CustomerDetailView({
           </div>
         )}
 
-        {/* TAB 6: CREDIT NOTES */}
-        {activeTab === 'credit_notes' && (
-          <div className="space-y-4">
-            <h4 className="font-extrabold text-text-primary text-xs">Credit Notes Log</h4>
-            {!creditNotes || creditNotes.length === 0 ? (
-              <p className="text-text-muted text-[11px] italic">No credit notes issued for this customer.</p>
-            ) : (
-              <div className="divide-y divide-border-subtle border border-border-subtle rounded-2xl overflow-hidden bg-surface-card shadow-sm">
-                {creditNotes.map((note) => (
-                  <div key={note.id} className="p-3.5 flex items-center justify-between text-[11px]">
-                    <div>
-                      <p className="font-bold text-text-primary font-mono">{note.credit_note_number}</p>
-                      <p className="text-text-muted text-[10px]">{note.reason} • {formatDate(note.created_at)}</p>
-                    </div>
-                    <span className="font-mono font-bold text-brand-600 dark:text-brand-400">{formatPaise(note.amount_paise)}</span>
-                  </div>
-                ))}
+        {/* TAB 5: NOTES & REMINDERS */}
+        {(activeTab === 'notes' || activeTab === 'reminders' || activeTab === 'credit_notes') && (
+          <div className="space-y-6">
+            {/* Customer Internal Profile Notes */}
+            <div className="p-4 rounded-2xl bg-surface-card border border-border-subtle shadow-sm space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-text-primary uppercase tracking-wider">Account Notes & Cutting Preferences</span>
+                <button onClick={() => onEdit(customer)} className="text-[11px] text-brand-500 hover:underline flex items-center gap-1 font-bold">
+                  <Edit3 size={12} /> Edit Notes
+                </button>
               </div>
-            )}
+              <p className="text-xs text-text-secondary leading-relaxed bg-surface-panel p-3 rounded-xl border border-border-subtle">
+                {customer.notes || customer.special_instructions || 'No internal notes recorded for this customer profile.'}
+              </p>
+            </div>
+
+            {/* Payment & Visit Reminders */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h4 className="font-extrabold text-text-primary text-xs">Payment Due Reminders</h4>
+                <button
+                  onClick={() => setIsReminderOpen(!isReminderOpen)}
+                  className="btn-primary text-[10px] px-3 py-1.5 font-bold"
+                >
+                  Send Reminder
+                </button>
+              </div>
+
+              {isReminderOpen && (
+                <form onSubmit={handleSendReminder} className="p-4 bg-surface-card border border-border-subtle rounded-2xl space-y-3 shadow-sm">
+                  <div className="flex gap-2">
+                    <select
+                      value={reminderChannel}
+                      onChange={(e) => setReminderChannel(e.target.value)}
+                      className="bg-surface-panel border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs text-text-primary"
+                    >
+                      <option value="sms">SMS</option>
+                      <option value="whatsapp">WhatsApp</option>
+                      <option value="email">Email</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={reminderMsg}
+                      onChange={(e) => setReminderMsg(e.target.value)}
+                      placeholder="Enter reminder note..."
+                      className="flex-1 bg-surface-panel border border-border-subtle rounded-lg px-3 py-1.5 text-xs text-text-primary"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button type="button" onClick={() => setIsReminderOpen(false)} className="btn-secondary text-[10px] px-3 py-1">Cancel</button>
+                    <button type="submit" className="btn-primary text-[10px] px-3 py-1">Send</button>
+                  </div>
+                </form>
+              )}
+
+              {!reminders || reminders.length === 0 ? (
+                <p className="text-text-muted text-[11px] italic">No reminders sent yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {reminders.map((r) => (
+                    <div key={r.id} className="p-3 bg-surface-card border border-border-subtle rounded-xl text-[11px] flex justify-between items-center shadow-sm">
+                      <div>
+                        <span className="font-bold text-text-primary uppercase text-[9px] px-1.5 py-0.5 bg-surface-panel rounded border border-border-subtle mr-2">
+                          {r.channel}
+                        </span>
+                        <span className="text-text-secondary">{r.message || (r as any).message_body}</span>
+                      </div>
+                      <span className="text-[10px] text-text-muted">{formatDate(r.created_at)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Credit Notes Log */}
+            <div className="space-y-4">
+              <h4 className="font-extrabold text-text-primary text-xs">Credit Notes Log</h4>
+              {!creditNotes || creditNotes.length === 0 ? (
+                <p className="text-text-muted text-[11px] italic">No credit notes issued for this customer.</p>
+              ) : (
+                <div className="divide-y divide-border-subtle border border-border-subtle rounded-2xl overflow-hidden bg-surface-card shadow-sm">
+                  {creditNotes.map((note) => (
+                    <div key={note.id} className="p-3.5 flex items-center justify-between text-[11px]">
+                      <div>
+                        <p className="font-bold text-text-primary font-mono">{note.credit_note_number}</p>
+                        <p className="text-text-muted text-[10px]">{note.reason} • {formatDate(note.created_at)}</p>
+                      </div>
+                      <span className="font-mono font-bold text-brand-600 dark:text-brand-400">{formatPaise(note.amount_paise)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
-        {/* TAB 7: REMINDERS */}
-        {activeTab === 'reminders' && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h4 className="font-extrabold text-text-primary text-xs">Payment Due Reminders</h4>
-              <button
-                onClick={() => setIsReminderOpen(!isReminderOpen)}
-                className="btn-primary text-[10px] px-3 py-1.5 font-bold"
-              >
-                Send Reminder
-              </button>
-            </div>
-
-            {isReminderOpen && (
-              <form onSubmit={handleSendReminder} className="p-4 bg-surface-card border border-border-subtle rounded-2xl space-y-3 shadow-sm">
-                <div className="flex gap-2">
-                  <select
-                    value={reminderChannel}
-                    onChange={(e) => setReminderChannel(e.target.value)}
-                    className="bg-surface-panel border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs text-text-primary"
-                  >
-                    <option value="sms">SMS</option>
-                    <option value="whatsapp">WhatsApp</option>
-                    <option value="email">Email</option>
-                  </select>
-                  <input
-                    type="text"
-                    value={reminderMsg}
-                    onChange={(e) => setReminderMsg(e.target.value)}
-                    placeholder="Enter reminder note..."
-                    className="flex-1 bg-surface-panel border border-border-subtle rounded-lg px-3 py-1.5 text-xs text-text-primary"
-                  />
+        {/* TAB 6: PRIVACY & CONSENT MANAGEMENT */}
+        {activeTab === 'consent' && (
+          <div className="space-y-6">
+            <div className="p-5 rounded-2xl bg-surface-card border border-border-subtle shadow-sm space-y-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-brand-500/10 text-brand-500 border border-brand-500/20">
+                  <ShieldCheck size={20} />
                 </div>
-                <div className="flex justify-end gap-2">
-                  <button type="button" onClick={() => setIsReminderOpen(false)} className="btn-secondary text-[10px] px-3 py-1">Cancel</button>
-                  <button type="submit" className="btn-primary text-[10px] px-3 py-1">Send</button>
+                <div>
+                  <h4 className="font-extrabold text-sm text-text-primary">Communication & Privacy Consent</h4>
+                  <p className="text-xs text-text-muted mt-0.5">
+                    Explicit customer consent controls for digital invoices and marketing reminders
+                  </p>
                 </div>
-              </form>
-            )}
-
-            {!reminders || reminders.length === 0 ? (
-              <p className="text-text-muted text-[11px] italic">No reminders sent yet.</p>
-            ) : (
-              <div className="space-y-2">
-                {reminders.map((r) => (
-                  <div key={r.id} className="p-3 bg-surface-card border border-border-subtle rounded-xl text-[11px] flex justify-between items-center shadow-sm">
-                    <div>
-                      <span className="font-bold text-text-primary uppercase text-[9px] px-1.5 py-0.5 bg-surface-panel rounded border border-border-subtle mr-2">
-                        {r.channel}
-                      </span>
-                      <span className="text-text-secondary">{r.message || (r as any).message_body}</span>
-                    </div>
-                    <span className="text-[10px] text-text-muted">{formatDate(r.created_at)}</span>
-                  </div>
-                ))}
               </div>
-            )}
+
+              <div className="divide-y divide-border-subtle">
+                {/* Consent 1: WhatsApp Digital Invoices */}
+                <div className="py-4 flex items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <FileText size={16} className="text-emerald-500" />
+                      <span className="font-bold text-xs text-text-primary">Digital Bill via WhatsApp</span>
+                      {customer.whatsapp_bill_consent === 1 ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+                          Opted In ✓
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-zinc-500/10 text-text-muted border border-border-subtle">
+                          Opted Out
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-text-muted leading-relaxed max-w-xl">
+                      Permits preparing and sending transaction invoices via standard WhatsApp link (wa.me). No spam or marketing is allowed under this setting.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleToggleConsent('whatsapp_bill_consent', customer.whatsapp_bill_consent === 1 ? 0 : 1)}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-sm ${
+                      customer.whatsapp_bill_consent === 1
+                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                        : 'bg-surface-panel hover:bg-surface-hover border border-border-subtle text-text-secondary'
+                    }`}
+                  >
+                    {customer.whatsapp_bill_consent === 1 ? 'Consent Granted' : 'Grant Consent'}
+                  </button>
+                </div>
+
+                {/* Consent 2: Marketing & Retention Reminders */}
+                <div className="py-4 flex items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <Sparkles size={16} className="text-amber-500" />
+                      <span className="font-bold text-xs text-text-primary">Marketing & Visit Reminders</span>
+                      {customer.marketing_consent === 1 ? (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/30">
+                          Opted In ✓
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-zinc-500/10 text-text-muted border border-border-subtle">
+                          Opted Out
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-text-muted leading-relaxed max-w-xl">
+                      Permits the Retention Desk to send personalized weekend specials, fresh arrival alerts, and gentle visit reminders on WhatsApp.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleToggleConsent('marketing_consent', customer.marketing_consent === 1 ? 0 : 1)}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-sm ${
+                      customer.marketing_consent === 1
+                        ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                        : 'bg-surface-panel hover:bg-surface-hover border border-border-subtle text-text-secondary'
+                    }`}
+                  >
+                    {customer.marketing_consent === 1 ? 'Consent Granted' : 'Grant Consent'}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 

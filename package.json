@@ -7,11 +7,13 @@
   "license": "MIT",
   "scripts": {
     "dev:vite": "vite",
-    "build:electron": "tsc -p tsconfig.node.json",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3",
+    "build:electron": "npm run rebuild:native && tsc -p tsconfig.node.json",
     "build:web": "vite build",
     "build": "npm run build:web && npm run build:electron",
     "dev": "concurrently -k -n \"VITE,ELECTRON\" -c \"cyan,magenta\" \"vite\" \"wait-on tcp:3000 && npm run build:electron && electron .\"",
-    "lint": "tsc -p tsconfig.web.json --noEmit"
+    "lint": "tsc -p tsconfig.web.json --noEmit",
+    "postinstall": "npm run rebuild:native"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.50.1",

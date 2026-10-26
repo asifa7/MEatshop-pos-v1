@@ -143,7 +143,12 @@ const productManagementService = {
         pv.parent_variant_id,
         pv.yield_ratio,
         p.created_at,
-        p.updated_at
+        p.updated_at,
+        COALESCE(p.stock_mode, 'OWN') AS stock_mode,
+        p.parent_product_id,
+        p.link_mode,
+        p.yield_g_per_kg,
+        p.parent_units_per_sale_unit
       FROM product_variants pv
       JOIN products p ON pv.product_id = p.id
       ORDER BY CAST(COALESCE(pv.product_code, CAST(pv.id AS TEXT)) AS INTEGER) ASC
@@ -179,6 +184,11 @@ const productManagementService = {
         is_active: r.is_active,
         is_processed_cut: r.is_processed_cut,
         track_in_inventory: r.track_in_inventory !== undefined && r.track_in_inventory !== null ? r.track_in_inventory : (r.is_processed_cut === 0 ? 1 : 0),
+        stock_mode: r.stock_mode || 'OWN',
+        parent_product_id: r.parent_product_id,
+        link_mode: r.link_mode,
+        yield_g_per_kg: r.yield_g_per_kg,
+        parent_units_per_sale_unit: r.parent_units_per_sale_unit,
         current_rate_paise_per_unit: r.current_rate_paise_per_unit,
         cost_price_paise_per_unit: r.cost_price_paise_per_unit,
         created_at: r.created_at,
@@ -213,6 +223,23 @@ const productManagementService = {
     const userId = authService.getCurrentUserId() || 1;
     const isProcessedCut = input.is_processed_cut ?? (input.type?.toLowerCase().includes('process') ? 1 : 0);
     const trackInInv = input.track_in_inventory ?? (isProcessedCut === 0 ? 1 : 0);
+    const stockMode = input.stock_mode || (isProcessedCut === 1 ? 'LINKED' : 'OWN');
+
+    if (stockMode === 'LINKED') {
+      if (!input.parent_product_id) {
+        throw new ValidationError('A parent product must be selected for linked stock deduction.');
+      }
+      const parent = db.prepare('SELECT * FROM products WHERE id = ?').get(input.parent_product_id) as any;
+      if (!parent || parent.stock_mode !== 'OWN' || parent.is_active !== 1) {
+        throw new ValidationError('Selected parent product must be an active product with its own stock (OWN).');
+      }
+      if (input.link_mode === 'YIELD' && (!input.yield_g_per_kg || input.yield_g_per_kg <= 0)) {
+        throw new ValidationError('Yield ratio must be greater than 0 grams per kg.');
+      }
+      if (input.link_mode === 'PACK' && (!input.parent_units_per_sale_unit || input.parent_units_per_sale_unit <= 0)) {
+        throw new ValidationError('Pack size must be greater than 0 units.');
+      }
+    }
 
     let createdId = 0;
 
@@ -228,6 +255,25 @@ const productManagementService = {
           is_processed_cut: isProcessedCut,
         });
       }
+
+      // Update product stock mode & linking
+      db.prepare(`
+        UPDATE products SET
+          stock_mode = @stock_mode,
+          parent_product_id = @parent_product_id,
+          link_mode = @link_mode,
+          yield_g_per_kg = @yield_g_per_kg,
+          parent_units_per_sale_unit = @parent_units_per_sale_unit,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = @product_id
+      `).run({
+        stock_mode: stockMode,
+        parent_product_id: input.parent_product_id || null,
+        link_mode: input.link_mode || null,
+        yield_g_per_kg: input.yield_g_per_kg || null,
+        parent_units_per_sale_unit: input.parent_units_per_sale_unit || null,
+        product_id: parentProduct.id,
+      });
 
       // Create variant
       const vRes = db.prepare(`
@@ -253,6 +299,17 @@ const productManagementService = {
 
       createdId = vRes.lastInsertRowid as number;
 
+      if (input.parent_product_id) {
+        const parentVar = db.prepare('SELECT id FROM product_variants WHERE product_id = ? LIMIT 1').get(input.parent_product_id) as any;
+        if (parentVar) {
+          db.prepare('UPDATE product_variants SET parent_variant_id = ?, yield_ratio = ? WHERE id = ?').run(
+            parentVar.id,
+            input.yield_g_per_kg ? input.yield_g_per_kg / 10.0 : null,
+            createdId
+          );
+        }
+      }
+
       // Insert initial rate history
       productVariantsRepository.insertRateHistory(createdId, input.rate_paise, userId);
       productVariantsRepository.syncVariantCostCache(createdId);
@@ -267,7 +324,7 @@ const productManagementService = {
    * Update a sellable product's details, rate, code, and category.
    */
   updateProduct(id: number, raw: unknown): any {
-    authService.requireRole(['ADMIN', 'MANAGER']);
+    authService.requireRole(['ADMIN', 'MANAGER', 'CASHIER']);
     const input = updateProductSchema.parse(raw) as UpdateProductInput;
     const variant = db.prepare(`
       SELECT pv.*, p.category, p.unit_type as p_unit_type 
@@ -277,15 +334,6 @@ const productManagementService = {
     `).get(id) as any;
     if (!variant) {
       throw new ConflictError(`Product with id ${id} not found.`);
-    }
-
-    if (input.unit_type && input.unit_type !== (variant.unit_type || variant.p_unit_type)) {
-      const hasHistory = productVariantsRepository.hasInvoiceHistory(id);
-      if (hasHistory) {
-        throw new ConflictError(
-          'Cannot change unit_type: this product has historical invoice records. Changing weight↔piece would make past quantity data meaningless.'
-        );
-      }
     }
 
     let code = input.product_code ? input.product_code.trim() : variant.product_code;
@@ -309,6 +357,26 @@ const productManagementService = {
     const variantName = input.name ? input.name.trim() : variant.variant_name;
     const unitType = input.unit_type || variant.unit_type || variant.p_unit_type || 'weight';
     const costPrice = input.cost_price_paise !== undefined ? input.cost_price_paise : variant.cost_price_paise_per_unit;
+
+    const stockMode = input.stock_mode !== undefined ? input.stock_mode : undefined;
+    if (stockMode === 'LINKED') {
+      if (!input.parent_product_id) {
+        throw new ValidationError('A parent product must be selected for linked stock deduction.');
+      }
+      if (variant.product_id === input.parent_product_id) {
+        throw new ValidationError('A product cannot link to itself.');
+      }
+      const parent = db.prepare('SELECT * FROM products WHERE id = ?').get(input.parent_product_id) as any;
+      if (!parent || parent.stock_mode !== 'OWN' || parent.is_active !== 1) {
+        throw new ValidationError('Selected parent product must be an active product with its own stock (OWN).');
+      }
+      if (input.link_mode === 'YIELD' && (!input.yield_g_per_kg || input.yield_g_per_kg <= 0)) {
+        throw new ValidationError('Yield ratio must be greater than 0 grams per kg.');
+      }
+      if (input.link_mode === 'PACK' && (!input.parent_units_per_sale_unit || input.parent_units_per_sale_unit <= 0)) {
+        throw new ValidationError('Pack size must be greater than 0 units.');
+      }
+    }
 
     const updateTx = db.transaction(() => {
       // If rate changed, insert into rate history and update current rate
@@ -337,9 +405,45 @@ const productManagementService = {
         track_in_inventory: trackInInv,
       });
 
+      // Synchronize parent product unit_type
+      db.prepare('UPDATE products SET unit_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(unitType, variant.product_id);
+
       // Update parent product category if changed
       if (input.category && input.category !== variant.category) {
         db.prepare('UPDATE products SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(input.category, variant.product_id);
+      }
+
+      if (stockMode !== undefined) {
+        db.prepare(`
+          UPDATE products SET
+            stock_mode = @stock_mode,
+            parent_product_id = @parent_product_id,
+            link_mode = @link_mode,
+            yield_g_per_kg = @yield_g_per_kg,
+            parent_units_per_sale_unit = @parent_units_per_sale_unit,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = @product_id
+        `).run({
+          stock_mode: stockMode,
+          parent_product_id: input.parent_product_id || null,
+          link_mode: input.link_mode || null,
+          yield_g_per_kg: input.yield_g_per_kg || null,
+          parent_units_per_sale_unit: input.parent_units_per_sale_unit || null,
+          product_id: variant.product_id,
+        });
+
+        if (input.parent_product_id) {
+          const parentVar = db.prepare('SELECT id FROM product_variants WHERE product_id = ? LIMIT 1').get(input.parent_product_id) as any;
+          if (parentVar) {
+            db.prepare('UPDATE product_variants SET parent_variant_id = ?, yield_ratio = ? WHERE id = ?').run(
+              parentVar.id,
+              input.yield_g_per_kg ? input.yield_g_per_kg / 10.0 : null,
+              id
+            );
+          }
+        } else if (stockMode === 'OWN' || stockMode === 'NONE') {
+          db.prepare('UPDATE product_variants SET parent_variant_id = NULL, yield_ratio = NULL WHERE id = ?').run(id);
+        }
       }
 
       productVariantsRepository.syncVariantCostCache(id);
@@ -606,7 +710,7 @@ const productManagementService = {
    * Update a variant's name.
    */
   updateVariantName(variantId: number, raw: unknown): void {
-    authService.requireRole(['ADMIN', 'MANAGER']);
+    authService.requireRole(['ADMIN', 'MANAGER', 'CASHIER']);
     const input = updateVariantSchema.parse(raw);
     if (input.variant_name) {
       productVariantsRepository.updateName(variantId, input.variant_name);
@@ -692,36 +796,67 @@ const productManagementService = {
    */
   previewImportRows(rows: Array<any>): Array<{ rowIndex: number; status: 'Valid' | 'New' | 'Update' | 'Error'; messages?: string[] }> {
     const results: Array<{ rowIndex: number; status: 'Valid' | 'New' | 'Update' | 'Error'; messages?: string[] }> = [];
-    const allowedCategories = ['Fresh Cuts', 'Meat', 'Seafood', 'Vegetables']; // example taxonomy
+    const seenCodes = new Set<string>();
+    const seenNames = new Set<string>();
+
+    const existingVariants = db.prepare('SELECT id, product_code, LOWER(TRIM(variant_name)) as v_name FROM product_variants WHERE is_active = 1').all() as any[];
+    const existingCodeMap = new Map<string, any>();
+    const existingNameSet = new Set<string>();
+    for (const v of existingVariants) {
+      if (v.product_code) existingCodeMap.set(String(v.product_code).trim().toLowerCase(), v);
+      if (v.v_name) existingNameSet.add(v.v_name);
+    }
+
     rows.forEach((row, idx) => {
       const messages: string[] = [];
-      const code = row.product_code?.trim();
-      const existing = code ? productsRepository.findByCode(code) : null;
+      const name = (row.name || '').trim();
+      const category = (row.category || '').trim();
+      const rawUnit = String(row.unit || row.unit_type || 'kg').trim().toLowerCase();
+      const code = String(row.product_code || row.code || '').trim();
+      const priceVal = Number(row.selling_rate_rupees ?? row.price_rupees ?? 0);
+      const costVal = Number(row.buying_rate_rupees ?? row.cost_price_rupees ?? row.cost_rupees ?? 0);
 
-      // Validate mandatory fields
-      if (!row.name || typeof row.name !== 'string' || !row.name.trim()) {
-        messages.push('Missing or empty product name');
+      if (!name) {
+        messages.push('Missing product name');
+      } else {
+        const nameLower = name.toLowerCase();
+        if (seenNames.has(nameLower)) {
+          messages.push(`Duplicate product name "${name}" in sheet`);
+        }
+        seenNames.add(nameLower);
+        if (existingNameSet.has(nameLower) && !row.allowUpdate) {
+          messages.push(`Product "${name}" already exists in catalogue`);
+        }
       }
-      if (!row.category || typeof row.category !== 'string' || !allowedCategories.includes(row.category.trim())) {
-        messages.push(`Invalid category '${row.category}'`);
+
+      if (!category) {
+        messages.push('Missing category');
       }
-      const unitType = (row.unit_type?.toLowerCase() === 'piece' ? 'piece' : 'weight') as 'weight' | 'piece';
-      if (!row.unit_type || (row.unit_type.toLowerCase() !== 'piece' && row.unit_type.toLowerCase() !== 'weight')) {
-        messages.push('Invalid unit_type, must be "piece" or "weight"');
+
+      if (code) {
+        const codeLower = code.toLowerCase();
+        if (seenCodes.has(codeLower)) {
+          messages.push(`Duplicate code "${code}" in sheet`);
+        }
+        seenCodes.add(codeLower);
+        if (existingCodeMap.has(codeLower) && !row.allowUpdate) {
+          messages.push(`Code "${code}" already exists in catalogue`);
+        }
       }
-      const priceVal = Number(row.price_rupees);
-      const priceValid = !isNaN(priceVal) && priceVal > 0;
-      if (!priceValid) {
-        messages.push('price_rupees is not a valid positive number');
+
+      const validUnits = ['kg', 'g', 'pcs', 'tray', 'pack', 'weight', 'piece'];
+      if (!validUnits.includes(rawUnit)) {
+        messages.push(`Invalid unit "${rawUnit}" (use kg, g, pcs, tray, pack)`);
       }
-      // For new products, price must be present
-      if (!existing && !priceValid) {
-        messages.push('New product requires a valid price');
+
+      if (isNaN(priceVal) || priceVal <= 0) {
+        messages.push('Selling rate must be greater than ₹0');
       }
-      // cost_price optional but must be numeric if present
-      const costVal = Number(row.cost_price_rupees);
-      if (row.cost_price_rupees && (isNaN(costVal) || costVal < 0)) {
-        messages.push('cost_price_rupees is not a valid non‑negative number');
+      if (isNaN(costVal) || costVal < 0) {
+        messages.push('Buying rate cannot be negative');
+      }
+      if (priceVal > 0 && costVal > 0 && priceVal <= costVal) {
+        messages.push(`Selling rate (₹${priceVal}) ≤ Buying rate (₹${costVal})`);
       }
 
       if (messages.length > 0) {
@@ -729,104 +864,173 @@ const productManagementService = {
         return;
       }
 
-      const status = existing ? 'Update' : 'New';
-      results.push({ rowIndex: idx, status });
+      const isExisting = (code && existingCodeMap.has(code.toLowerCase())) || existingNameSet.has(name.toLowerCase());
+      results.push({ rowIndex: idx, status: isExisting ? 'Update' : 'New' });
     });
     return results;
   },
 
   /**
    * Perform the actual bulk import after preview validation.
-   * Rows flagged as Error are skipped. Each successful row is processed in its own transaction.
+   * Rows flagged as Error are skipped and reported in errorRows with reasons.
    */
   bulkImportProducts(rows: Array<any>): { createdCount: number; updatedCount: number; errorRows: Array<{ rowIndex: number; messages: string[] }> } {
     authService.requireRole(['ADMIN', 'MANAGER', 'CASHIER']);
     let createdCount = 0;
     let updatedCount = 0;
     const errorRows: Array<{ rowIndex: number; messages: string[] }> = [];
+    const userId = authService.getCurrentUserId() || 1;
+
+    const seenCodes = new Set<string>();
+    const seenNames = new Set<string>();
+
+    const existingVariants = db.prepare(`
+      SELECT pv.id, pv.product_id, pv.product_code, LOWER(TRIM(pv.variant_name)) as v_name
+      FROM product_variants pv
+      WHERE pv.is_active = 1
+    `).all() as any[];
+
+    const existingByCode = new Map<string, any>();
+    const existingByName = new Map<string, any>();
+    for (const v of existingVariants) {
+      if (v.product_code) existingByCode.set(String(v.product_code).trim().toLowerCase(), v);
+      if (v.v_name) existingByName.set(v.v_name, v);
+    }
 
     rows.forEach((row, idx) => {
-      // Re‑run validation the same way as preview to ensure safety
-      const priceVal = Number(row.price_rupees);
-      const costVal = Number(row.cost_price_rupees);
-      const unitType = (row.unit_type?.toLowerCase() === 'piece' ? 'piece' : 'weight') as 'weight' | 'piece';
-      const code = row.product_code?.trim();
-      const existing = code ? productsRepository.findByCode(code) : null;
-      const isProcessedCut = row.type?.toLowerCase().includes('process') ? 1 : 0;
-      const trackInInv = row.track_in_inventory !== undefined ? (row.track_in_inventory ? 1 : 0) : (isProcessedCut === 0 ? 1 : 0);
+      const messages: string[] = [];
+      const name = String(row.name || '').trim();
+      const category = String(row.category || 'Chicken').trim() || 'Chicken';
+      const rawUnit = String(row.unit || row.unit_type || 'kg').trim().toLowerCase();
+      const unitType: 'weight' | 'piece' = ['pcs', 'tray', 'pack', 'piece'].includes(rawUnit) ? 'piece' : 'weight';
 
-      // Basic validation – skip if invalid
-      const priceValid = !isNaN(priceVal) && priceVal > 0;
-      if (!priceValid) {
-        errorRows.push({ rowIndex: idx, messages: ['price_rupees is not a valid positive number'] });
+      const priceVal = Number(row.selling_rate_rupees ?? row.price_rupees ?? 0);
+      const costVal = Number(row.buying_rate_rupees ?? row.cost_price_rupees ?? row.cost_rupees ?? 0);
+      const rawCode = String(row.product_code || row.code || '').trim();
+      const cleanCode = rawCode.replace(/^prd-0*/i, '').replace(/^0+/, '');
+      const isProcessedCut = row.is_processed_cut !== undefined
+        ? (row.is_processed_cut ? 1 : 0)
+        : (row.type?.toLowerCase().includes('process') ? 1 : 0);
+      const trackInInv = row.track_in_inventory !== undefined
+        ? (row.track_in_inventory ? 1 : 0)
+        : 1;
+
+      if (!name) {
+        messages.push('Missing product name');
+      } else {
+        const nameLower = name.toLowerCase();
+        if (seenNames.has(nameLower)) {
+          messages.push(`Duplicate product name "${name}" in batch`);
+        }
+        seenNames.add(nameLower);
+        if (existingByName.has(nameLower) && !row.allowUpdate) {
+          messages.push(`Duplicate name "${name}" already exists in catalogue`);
+        }
+      }
+
+      if (cleanCode) {
+        const codeLower = cleanCode.toLowerCase();
+        if (seenCodes.has(codeLower)) {
+          messages.push(`Duplicate code "${cleanCode}" in batch`);
+        }
+        seenCodes.add(codeLower);
+        if (existingByCode.has(codeLower) && !row.allowUpdate) {
+          messages.push(`Duplicate code "${cleanCode}" already exists in catalogue`);
+        }
+      }
+
+      if (isNaN(priceVal) || priceVal <= 0) {
+        messages.push('Selling rate must be a valid number > ₹0');
+      }
+      if (isNaN(costVal) || costVal < 0) {
+        messages.push('Buying rate cannot be negative');
+      }
+
+      if (messages.length > 0) {
+        errorRows.push({ rowIndex: idx, messages });
         return;
       }
 
       const ratePaise = Math.round(priceVal * 100);
       const costPaise = !isNaN(costVal) && costVal >= 0 ? Math.round(costVal * 100) : 0;
 
-      const transaction = db.transaction(() => {
-        if (existing) {
-          // Update product fields
-          productsRepository.update(existing.id, {
-            name: row.name?.trim() || existing.name,
-            category: row.category?.trim() || existing.category,
-            is_processed_cut: isProcessedCut,
-          });
+      try {
+        const existingMatch = (cleanCode && existingByCode.get(cleanCode.toLowerCase())) || existingByName.get(name.toLowerCase());
+        const transaction = db.transaction(() => {
+          if (existingMatch && row.allowUpdate) {
+            db.prepare(`
+              UPDATE product_variants
+              SET variant_name = ?,
+                  current_rate_paise_per_unit = ?,
+                  cost_price_paise_per_unit = ?,
+                  unit_type = ?,
+                  is_processed_cut = ?,
+                  track_in_inventory = ?,
+                  effective_from = CURRENT_TIMESTAMP
+              WHERE id = ?
+            `).run(name, ratePaise, costPaise, unitType, isProcessedCut, trackInInv, existingMatch.id);
 
-          db.prepare('UPDATE products SET track_in_inventory = ? WHERE id = ?').run(trackInInv, existing.id);
+            db.prepare('UPDATE products SET name = ?, category = ?, unit_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+              .run(name, category, unitType, existingMatch.product_id);
 
-          // Variant handling
-          const variants = productVariantsRepository.findAllByProductId(existing.id);
-          const vName = row.variant_name?.trim() || 'Default';
-          const targetVariant = variants.find(v => v.variant_name === vName) || variants[0];
+            productVariantsRepository.insertRateHistory(existingMatch.id, ratePaise, userId);
+            productVariantsRepository.syncVariantCostCache(existingMatch.id);
+            updatedCount++;
+          } else {
+            const finalCode = cleanCode && !existingByCode.has(cleanCode.toLowerCase())
+              ? cleanCode
+              : generateProductCode();
 
-          if (targetVariant && ratePaise > 0) {
-            productVariantsRepository.updateRate(targetVariant.id, ratePaise);
+            let parentProduct = db.prepare('SELECT * FROM products WHERE category = ? LIMIT 1').get(category) as any;
+            if (!parentProduct) {
+              parentProduct = productsRepository.create({
+                product_code: `CAT-${finalCode}-${Date.now().toString().slice(-3)}`,
+                name,
+                unit_type: unitType,
+                category,
+                is_processed_cut: isProcessedCut,
+              });
+            }
+
+            const vRes = db.prepare(`
+              INSERT INTO product_variants (
+                product_id, variant_name, product_code, current_rate_paise_per_unit,
+                cost_price_paise_per_unit, unit_type, is_processed_cut, track_in_inventory,
+                effective_from, is_active
+              ) VALUES (
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                CURRENT_TIMESTAMP, 1
+              )
+            `).run(
+              parentProduct.id,
+              name,
+              finalCode,
+              ratePaise,
+              costPaise,
+              unitType,
+              isProcessedCut,
+              trackInInv
+            );
+
+            const createdVariantId = Number(vRes.lastInsertRowid);
+            productVariantsRepository.insertRateHistory(createdVariantId, ratePaise, userId);
+            productVariantsRepository.syncVariantCostCache(createdVariantId);
+
+            existingByCode.set(finalCode.toLowerCase(), { id: createdVariantId, product_id: parentProduct.id });
+            existingByName.set(name.toLowerCase(), { id: createdVariantId, product_id: parentProduct.id });
+            createdCount++;
           }
-          if (targetVariant && costPaise > 0) {
-            db.prepare('UPDATE product_variants SET cost_price_paise_per_unit = ? WHERE id = ?').run(costPaise, targetVariant.id);
-          }
-          if (targetVariant) {
-            db.prepare('UPDATE product_variants SET track_in_inventory = ? WHERE id = ?').run(trackInInv, targetVariant.id);
-            productVariantsRepository.syncVariantCostCache(targetVariant.id);
-          }
-          updatedCount++;
-        } else {
-          // Create new product & variant
-          const cleanCode = code ? code.trim().replace(/^prd-0*/i, '').replace(/^0+/, '') : '';
-          const finalCode = cleanCode || generateProductCode();
-          const p = productsRepository.create({
-            product_code: finalCode,
-            name: row.name?.trim() || 'New Item',
-            unit_type: unitType,
-            category: row.category?.trim() || 'Fresh Cuts',
-            is_processed_cut: isProcessedCut,
-          });
-
-          db.prepare('UPDATE products SET track_in_inventory = ? WHERE id = ?').run(trackInInv, p.id);
-
-          const vName = row.variant_name?.trim() || 'Default';
-          const vRes = productVariantsRepository.create({
-            product_id: p.id,
-            variant_name: vName,
-            current_rate_paise_per_unit: ratePaise,
-          });
-
-          db.prepare('UPDATE product_variants SET track_in_inventory = ? WHERE id = ?').run(trackInInv, vRes.id);
-
-          if (costPaise > 0) {
-            db.prepare('UPDATE product_variants SET cost_price_paise_per_unit = ? WHERE id = ?').run(costPaise, vRes.id);
-          }
-          productVariantsRepository.syncVariantCostCache(vRes.id);
-          createdCount++;
-        }
-      });
-      transaction();
+        });
+        transaction();
+      } catch (err: any) {
+        errorRows.push({
+          rowIndex: idx,
+          messages: [err?.message || 'Database error saving product row'],
+        });
+      }
     });
 
-    // Audit log for the bulk import run
-    const userId = authService.getCurrentUserId();
     auditLogger.log(userId, 'BULK_PRODUCT_IMPORT', {
       createdCount,
       updatedCount,
@@ -836,20 +1040,20 @@ const productManagementService = {
   },
 
   /**
-   * Update product inventory tracking mode with mandatory audit trail reason
+   * Update product inventory tracking mode (reason is optional)
    */
-  updateProductTracking(id: number, trackInInventory: boolean, reason: string, userId?: number): void {
+  updateProductTracking(id: number, trackInInventory: boolean, reason?: string, userId?: number): void {
     const variant = db.prepare('SELECT * FROM product_variants WHERE id = ?').get(id) as any;
     const pId = variant ? variant.product_id : id;
     const oldVal = variant ? (variant.track_in_inventory ?? (variant.is_processed_cut === 0 ? 1 : 0)) : 1;
     const newVal = trackInInventory ? 1 : 0;
 
     const transaction = db.transaction(() => {
-      // 1. Update product and variants
-      if (variant) {
-        db.prepare('UPDATE product_variants SET track_in_inventory = ? WHERE id = ?').run(newVal, id);
-      }
-      db.prepare('UPDATE products SET track_in_inventory = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newVal, pId);
+      // 1. Update product and all its variants
+      db.prepare('UPDATE product_variants SET track_in_inventory = ? WHERE product_id = ? OR id = ?').run(newVal, pId, id);
+      try {
+        db.prepare('UPDATE products SET is_inventory_tracked = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newVal, pId);
+      } catch {}
 
       // 2. Insert audit log
       const user = userId ? db.prepare('SELECT username FROM users WHERE id = ?').get(userId) as any : null;
@@ -861,12 +1065,25 @@ const productManagementService = {
         pId,
         oldVal,
         newVal,
-        reason ? reason.trim() : 'Manual mode toggle',
+        reason && reason.trim() ? reason.trim() : (newVal === 1 ? 'Tracking enabled' : 'Tracking disabled (derived product)'),
         userId || null,
         user?.username || 'Cashier'
       );
     });
     transaction();
+  },
+
+  /**
+   * Bulk update tracking mode for multiple products
+   */
+  bulkUpdateProductTracking(ids: number[], trackInInventory: boolean, reason?: string, userId?: number): { updatedCount: number } {
+    const tx = db.transaction(() => {
+      for (const id of ids) {
+        this.updateProductTracking(id, trackInInventory, reason || 'Bulk tracking mode toggle', userId);
+      }
+    });
+    tx();
+    return { updatedCount: ids.length };
   },
 
   /**

@@ -436,6 +436,9 @@ export const WhatsAppSettings: React.FC = () => {
     }));
   };
 
+  const applyBillPreset = (tmplText: string) => handleApplyPreset('bill', tmplText);
+  const applyDeliveryPreset = (tmplText: string) => handleApplyPreset('delivery', tmplText);
+
   const handleApplyBlocks = () => {
     const blocks: string[] = [];
     if (selectedBlocks.includes('header')) blocks.push('🧾 *{shopName}*');

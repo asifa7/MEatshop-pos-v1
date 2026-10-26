@@ -67,6 +67,13 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
   const [trackingLogs, setTrackingLogs] = useState<TrackingLog[]>([]);
   const [showTrackingHistory, setShowTrackingHistory] = useState(false);
 
+  // Stock Mode State (OWN | LINKED | NONE)
+  const [stockMode, setStockMode] = useState<'OWN' | 'LINKED' | 'NONE'>('OWN');
+  const [parentProductId, setParentProductId] = useState<number | null>(null);
+  const [linkMode, setLinkMode] = useState<'YIELD' | 'PACK'>('YIELD');
+  const [yieldGPerKg, setYieldGPerKg] = useState<number>(550);
+  const [parentUnitsPerSaleUnit, setParentUnitsPerSaleUnit] = useState<number>(1);
+
   // Inline "Add New" state toggles
   const [isAddingNewCategory, setIsAddingNewCategory] = useState(false);
   const [newCategoryInput, setNewCategoryInput] = useState('');
@@ -109,6 +116,12 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
         setTrackInInventory(initialTrack);
         setOriginalTrackInInventory(initialTrack);
 
+        setStockMode(editTarget.stock_mode || (editTarget.is_processed_cut === 1 ? 'LINKED' : 'OWN'));
+        setParentProductId(editTarget.parent_product_id || null);
+        setLinkMode(editTarget.link_mode || 'YIELD');
+        setYieldGPerKg(editTarget.yield_g_per_kg || 550);
+        setParentUnitsPerSaleUnit(editTarget.parent_units_per_sale_unit || 1);
+
         // Fetch tracking audit log history
         window.api.invoke(IPC_CHANNELS.PRODUCTS.GET_TRACKING_HISTORY, { productId: editTarget.id })
           .then((res: any) => {
@@ -127,6 +140,11 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
         setTrackInInventory(true);
         setOriginalTrackInInventory(true);
         setTrackingLogs([]);
+        setStockMode('OWN');
+        setParentProductId(null);
+        setLinkMode('YIELD');
+        setYieldGPerKg(550);
+        setParentUnitsPerSaleUnit(1);
 
         // Compute next auto code: highest integer code + 1 (e.g. 1, 2, 3... or 9, 10...)
         let highestNum = 0;
@@ -144,6 +162,31 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
       }
     }
   }, [isOpen, editTarget, allProducts, availableCategories, availableTypes]);
+
+  // Own Products list for linked stock parent dropdown
+  const ownProductsList = useMemo(() => {
+    return allProducts.filter(p => (p.stock_mode === 'OWN' || (!p.stock_mode && p.is_processed_cut === 0)) && (!isEdit || p.id !== editTarget?.id));
+  }, [allProducts, isEdit, editTarget]);
+
+  const selectedParent = useMemo(() => {
+    return allProducts.find(p => p.id === parentProductId);
+  }, [allProducts, parentProductId]);
+
+  const parentName = selectedParent?.name || 'Parent Product';
+
+  const conversionPreview = useMemo(() => {
+    if (stockMode !== 'LINKED') return 'Item maintains its own stock.';
+    if (!parentProductId) return 'Select a parent product above to see live conversion preview.';
+    if (linkMode === 'YIELD') {
+      const yg = Number(yieldGPerKg) || 0;
+      if (yg <= 0) return 'Enter a valid yield ratio (g/kg) > 0.';
+      const parentKgNeeded = (1000 / yg).toFixed(3);
+      return `Selling 1 kg ${name || 'Item'} uses ${parentKgNeeded} kg ${parentName}`;
+    } else {
+      const units = Number(parentUnitsPerSaleUnit) || 1;
+      return `Selling 1 unit of ${name || 'Item'} uses ${units} units of ${parentName}`;
+    }
+  }, [stockMode, parentProductId, linkMode, yieldGPerKg, parentUnitsPerSaleUnit, name, parentName]);
 
   // Real-time Product Code Uniqueness Check
   const codeConflictProduct = useMemo(() => {
@@ -218,11 +261,23 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
     const ratePaise = Math.round(rateNum * 100);
     const isProcessed = type.toLowerCase().includes('process') ? 1 : 0;
 
-    const isTrackingChanged = isEdit && editTarget && trackInInventory !== originalTrackInInventory;
-    if (isTrackingChanged && !trackingChangeReason.trim()) {
-      setError('Please provide a mandatory reason/note for changing the inventory tracking setting.');
-      return;
+    // Validate stock mode constraints
+    if (stockMode === 'LINKED') {
+      if (!parentProductId) {
+        setError('Please select a Parent Product for linked stock deduction.');
+        return;
+      }
+      if (linkMode === 'YIELD' && (!yieldGPerKg || yieldGPerKg <= 0)) {
+        setError('Please enter a valid yield ratio (g per kg) greater than 0.');
+        return;
+      }
+      if (linkMode === 'PACK' && (!parentUnitsPerSaleUnit || parentUnitsPerSaleUnit <= 0)) {
+        setError('Please enter a valid pack size greater than 0 units.');
+        return;
+      }
     }
+
+    const isTrackingChanged = isEdit && editTarget && trackInInventory !== originalTrackInInventory;
 
     try {
       if (isEdit && editTarget) {
@@ -237,16 +292,21 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
             rate_paise: ratePaise,
             cost_price_paise: costPricePaise,
             is_processed_cut: isProcessed,
-            track_in_inventory: trackInInventory ? 1 : 0,
+            track_in_inventory: stockMode === 'OWN' ? 1 : 0,
+            stock_mode: stockMode,
+            parent_product_id: stockMode === 'LINKED' ? parentProductId : null,
+            link_mode: stockMode === 'LINKED' ? linkMode : null,
+            yield_g_per_kg: (stockMode === 'LINKED' && linkMode === 'YIELD') ? Number(yieldGPerKg) : null,
+            parent_units_per_sale_unit: (stockMode === 'LINKED' && linkMode === 'PACK') ? Number(parentUnitsPerSaleUnit) : null,
           },
         });
 
-        // If tracking was changed, record audit entry
+        // If tracking was changed, record audit entry (reason is optional)
         if (isTrackingChanged) {
           await window.api.invoke(IPC_CHANNELS.PRODUCTS.UPDATE_TRACKING_MODE, {
             id: editTarget.id,
-            trackInInventory,
-            reason: trackingChangeReason.trim(),
+            trackInInventory: stockMode === 'OWN',
+            reason: trackingChangeReason.trim() || (trackInInventory ? 'Tracking enabled' : 'Tracking disabled (derived product)'),
           });
         }
       } else {
@@ -259,7 +319,12 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
           rate_paise: ratePaise,
           cost_price_paise: costPricePaise,
           is_processed_cut: isProcessed,
-          track_in_inventory: trackInInventory ? 1 : 0,
+          track_in_inventory: stockMode === 'OWN' ? 1 : 0,
+          stock_mode: stockMode,
+          parent_product_id: stockMode === 'LINKED' ? parentProductId : null,
+          link_mode: stockMode === 'LINKED' ? linkMode : null,
+          yield_g_per_kg: (stockMode === 'LINKED' && linkMode === 'YIELD') ? Number(yieldGPerKg) : null,
+          parent_units_per_sale_unit: (stockMode === 'LINKED' && linkMode === 'PACK') ? Number(parentUnitsPerSaleUnit) : null,
         });
       }
       onClose();
@@ -568,56 +633,205 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
             </div>
           </div>
 
-          {/* 8. Track in Inventory Toggle */}
-          <div className="p-3 bg-surface-card border border-border-subtle rounded-xl flex flex-col gap-2.5">
-            <div className="flex items-center justify-between gap-3">
-              <div className="space-y-0.5">
-                <label htmlFor="chk-track-inventory" className="text-xs font-extrabold text-text-primary flex items-center gap-1.5 cursor-pointer">
-                  <Layers size={13} className="text-brand-500" />
-                  <span>Track in Inventory</span>
-                  <span className={`text-[9.5px] px-1.5 py-0.5 rounded font-bold ${trackInInventory ? 'bg-emerald-500/20 text-emerald-400' : 'bg-surface-panel text-text-muted'}`}>
-                    {trackInInventory ? 'ON' : 'OFF'}
-                  </span>
-                </label>
-                <p className="text-[10px] text-text-muted">
-                  Default is ON for inventory valuation and stock management.
-                </p>
-              </div>
-              <label className="relative inline-flex items-center cursor-pointer">
-                <input
-                  id="chk-track-inventory"
-                  type="checkbox"
-                  checked={trackInInventory}
-                  onChange={e => setTrackInInventory(e.target.checked)}
-                  className="sr-only peer"
-                />
-                <div className="w-11 h-6 bg-surface-hover peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-brand-500"></div>
+          {/* 8. How is stock kept for this product? */}
+          <div className="p-3.5 bg-surface-card border border-border-subtle rounded-xl space-y-3">
+            <div className="space-y-0.5">
+              <label className="text-xs font-extrabold text-text-primary flex items-center gap-1.5">
+                <Package size={14} className="text-brand-500" />
+                <span>8. How is stock kept for this product? *</span>
               </label>
+              <p className="text-[10.5px] text-text-muted">
+                Choose how inventory is managed: physical item with own stock, cut/pack taking stock from another product, or service only.
+              </p>
             </div>
 
-            {/* Mandatory Reason Box when toggle is changed on existing product */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setStockMode('OWN');
+                  setTrackInInventory(true);
+                }}
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  stockMode === 'OWN'
+                    ? 'bg-brand-500/10 border-brand-500 text-brand-400 ring-1 ring-brand-500'
+                    : 'bg-surface-app border-border-subtle hover:border-brand-500/40 text-text-secondary'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-extrabold text-xs text-text-primary">1. Own Stock</span>
+                  {stockMode === 'OWN' && <Check size={14} className="text-brand-500" />}
+                </div>
+                <p className="text-[9.5px] text-text-muted">Item has its own physical count/weight on hand.</p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setStockMode('LINKED');
+                  setTrackInInventory(false);
+                }}
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  stockMode === 'LINKED'
+                    ? 'bg-amber-500/10 border-amber-500 text-amber-400 ring-1 ring-amber-500'
+                    : 'bg-surface-app border-border-subtle hover:border-amber-500/40 text-text-secondary'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-extrabold text-xs text-text-primary">2. Takes Stock</span>
+                  {stockMode === 'LINKED' && <Check size={14} className="text-amber-500" />}
+                </div>
+                <p className="text-[9.5px] text-text-muted">Cut or pack taking stock from another product.</p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setStockMode('NONE');
+                  setTrackInInventory(false);
+                }}
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  stockMode === 'NONE'
+                    ? 'bg-blue-500/10 border-blue-500 text-blue-400 ring-1 ring-blue-500'
+                    : 'bg-surface-app border-border-subtle hover:border-blue-500/40 text-text-secondary'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-extrabold text-xs text-text-primary">3. No Stock</span>
+                  {stockMode === 'NONE' && <Check size={14} className="text-blue-500" />}
+                </div>
+                <p className="text-[9.5px] text-text-muted">Non-physical item (service, transport, fee).</p>
+              </button>
+            </div>
+
+            {/* Linked Sub-Form */}
+            {stockMode === 'LINKED' && (
+              <div className="p-3 bg-surface-app border border-amber-500/30 rounded-xl space-y-3 mt-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Parent Product Selector (from OWN products only) */}
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-extrabold uppercase text-text-muted">
+                      Parent Product (OWN items only) *
+                    </label>
+                    <select
+                      value={parentProductId || ''}
+                      onChange={e => setParentProductId(e.target.value ? Number(e.target.value) : null)}
+                      required
+                      className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-bold text-text-primary outline-none focus:border-amber-500"
+                    >
+                      <option value="">-- Select Parent Product --</option>
+                      {ownProductsList.map(p => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.unit_type === 'weight' || p.unit_type === 'live_dual' ? 'kg' : 'pcs'})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Link Mode (YIELD vs PACK) */}
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-extrabold uppercase text-text-muted">
+                      Conversion Link Mode *
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setLinkMode('YIELD')}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-bold border transition-colors ${
+                          linkMode === 'YIELD'
+                            ? 'bg-amber-500 text-white border-amber-600'
+                            : 'bg-surface-card text-text-secondary border-border-subtle hover:bg-surface-hover'
+                        }`}
+                      >
+                        Yield (g / kg)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setLinkMode('PACK')}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-bold border transition-colors ${
+                          linkMode === 'PACK'
+                            ? 'bg-amber-500 text-white border-amber-600'
+                            : 'bg-surface-card text-text-secondary border-border-subtle hover:bg-surface-hover'
+                        }`}
+                      >
+                        Pack Size (Units)
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Yield or Pack Size input */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {linkMode === 'YIELD' ? (
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-extrabold uppercase text-text-muted">
+                        Yield (grams of this product per 1000g parent) *
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="1000"
+                        value={yieldGPerKg || ''}
+                        onChange={e => setYieldGPerKg(Number(e.target.value))}
+                        placeholder="e.g. 550 for skinless, 625 for dressed"
+                        required
+                        className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono font-bold text-text-primary outline-none focus:border-amber-500"
+                      />
+                      <p className="text-[9px] text-text-muted">
+                        Standard: Skinless = 550 g/kg (55%), Dressed = 625 g/kg (62.5%), Boneless = 350 g/kg (35%).
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-extrabold uppercase text-text-muted">
+                        Parent units used per 1 sale unit *
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={parentUnitsPerSaleUnit || 1}
+                        onChange={e => setParentUnitsPerSaleUnit(Number(e.target.value))}
+                        placeholder="e.g. 1 unit"
+                        required
+                        className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono font-bold text-text-primary outline-none focus:border-amber-500"
+                      />
+                    </div>
+                  )}
+
+                  {/* Live Conversion Preview Line */}
+                  <div className="flex flex-col justify-center p-2.5 bg-surface-card rounded-lg border border-amber-500/20 text-xs">
+                    <span className="text-[9px] font-black uppercase tracking-wider text-amber-500">Live Conversion Preview:</span>
+                    <span className="font-semibold text-text-primary mt-0.5">
+                      {conversionPreview}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+            {/* Reason Box when toggle is changed on existing product (optional) */}
             {isEdit && trackInInventory !== originalTrackInInventory && (
-              <div className="mt-1 p-3 bg-amber-950/30 border border-amber-800/50 rounded-lg space-y-2">
-                <div className="flex items-center gap-1.5 text-xs font-bold text-amber-400">
-                  <AlertTriangle size={14} className="shrink-0" />
+              <div className="mt-1 p-3 bg-brand-500/10 border border-brand-500/20 rounded-lg space-y-2">
+                <div className="flex items-center gap-1.5 text-xs font-bold text-brand-400">
+                  <Layers size={14} className="shrink-0" />
                   <span>Changing Tracking Mode ({originalTrackInInventory ? 'ON ➔ OFF' : 'OFF ➔ ON'})</span>
                 </div>
-                <p className="text-[10.5px] text-amber-200/80 leading-relaxed">
+                <p className="text-[10.5px] text-text-muted leading-relaxed">
                   {trackInInventory 
-                    ? 'Switching tracking ON will resume ledger auditing and valuation calculations for this product.'
-                    : 'Switching tracking OFF will bypass direct physical stock deduction limits for this product. Existing historical ledger records will be preserved.'}
+                    ? 'Switching tracking ON will resume stock alerts and valuation calculations for this product.'
+                    : 'Switching tracking OFF will bypass stock attention and low stock alerts (ideal for cuts derived from live stock like chicken boneless/bone).'}
                 </p>
                 <div>
                   <label className="block text-[10px] font-bold text-text-secondary uppercase mb-1">
-                    Reason for Change (Mandatory Audit Trail) *
+                    Reason for Change (Optional)
                   </label>
                   <input
                     type="text"
                     value={trackingChangeReason}
                     onChange={e => setTrackingChangeReason(e.target.value)}
-                    placeholder="e.g., Stock reconciliation / moving to non-tracked item..."
-                    required
-                    className="w-full bg-surface-panel border border-amber-700/60 rounded-lg px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-brand-500"
+                    placeholder="Optional note (e.g., derived from live chicken)..."
+                    className="w-full bg-surface-panel border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-brand-500"
                   />
                 </div>
               </div>
@@ -664,7 +878,6 @@ export default function ProductForm({ isOpen, onClose, editTarget }: ProductForm
                 )}
               </div>
             )}
-          </div>
 
           {error && (
             <div className="px-3.5 py-2.5 rounded-xl bg-rose-500/10 border border-rose-500/25 text-xs font-semibold text-rose-400">

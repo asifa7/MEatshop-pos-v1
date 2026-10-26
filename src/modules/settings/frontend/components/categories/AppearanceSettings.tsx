@@ -1,5 +1,5 @@
 import React from 'react';
-import { Palette, Sun, Moon, Monitor, LayoutGrid, ShoppingCart } from 'lucide-react';
+import { Palette, Sun, Moon, Monitor, LayoutGrid, ShoppingCart, PanelLeftClose } from 'lucide-react';
 import { SettingCard } from '../ui/SettingCard';
 import { SettingRow } from '../ui/SettingRow';
 import { AccentSwatchPicker } from '../ui/AccentSwatchPicker';
@@ -65,6 +65,25 @@ export const AppearanceSettings: React.FC = () => {
         icon={<LayoutGrid size={16} />}
       >
         <SettingRow
+          label="Billing Screen Design"
+          description="Standard POS (catalog grid layout) or Express Counter (streamlined 3-column fast billing)"
+        >
+          <SegmentedControl<'standard' | 'express'>
+            value={draftAppearance.billingStyle || 'standard'}
+            options={[
+              { value: 'standard', label: 'Standard POS' },
+              { value: 'express', label: 'Express Counter' },
+            ]}
+            onChange={(val) =>
+              updateDraftAppearance((prev) => ({
+                ...prev,
+                billingStyle: val,
+              }))
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
           label="Register Screen Mode"
           description="Touch screen (large touch targets) or Classic desktop (compact fast typing)"
         >
@@ -118,6 +137,51 @@ export const AppearanceSettings: React.FC = () => {
               updateDraftAppearance((prev) => ({
                 ...prev,
                 cartDisplay: val,
+              }))
+            }
+          />
+        </SettingRow>
+      </SettingCard>
+
+      {/* Navigation Sidebar (Brave Style) */}
+      <SettingCard
+        title="Navigation Sidebar (Brave Style)"
+        description="Configure sidebar collapse and mouse hover auto-expansion"
+        icon={<PanelLeftClose size={16} />}
+      >
+        <SettingRow
+          label="Auto-Expand on Hover"
+          description="When sidebar is collapsed to icon rail, moving mouse cursor over it expands the menu (same as Brave browser)"
+        >
+          <SegmentedControl<'on' | 'off'>
+            value={draftAppearance.sidebarHoverExpand === false ? 'off' : 'on'}
+            options={[
+              { value: 'on', label: 'Enabled (Brave style)' },
+              { value: 'off', label: 'Disabled' },
+            ]}
+            onChange={(val) =>
+              updateDraftAppearance((prev) => ({
+                ...prev,
+                sidebarHoverExpand: val === 'on',
+              }))
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
+          label="Sidebar Layout State"
+          description="Default view for the navigation sidebar"
+        >
+          <SegmentedControl<'expanded' | 'collapsed'>
+            value={draftAppearance.sidebarCollapsed ? 'collapsed' : 'expanded'}
+            options={[
+              { value: 'expanded', label: 'Expanded (Full)' },
+              { value: 'collapsed', label: 'Collapsed (Icon Rail)' },
+            ]}
+            onChange={(val) =>
+              updateDraftAppearance((prev) => ({
+                ...prev,
+                sidebarCollapsed: val === 'collapsed',
               }))
             }
           />

@@ -6,6 +6,7 @@ import {
   useSupplierSnapshot,
   usePassbookLedger,
   useEditPurchaseRecord,
+  useLastPurchaseRate,
 } from '../../hooks/useSupplierProcurement';
 import { useActiveRates } from '../../../../billing/frontend/hooks/useActiveRates';
 import { formatPaise, formatDate, PassbookLedgerEntry } from '../../types/supplier.types';
@@ -13,12 +14,46 @@ import { QuickPurchaseSchema } from '../../validation/supplier_procurement.schem
 import InvoiceTemplateModal, { InvoiceTemplateData } from './InvoiceTemplateModal';
 import { useQuickPurchaseStore } from '../../hooks/useQuickPurchaseStore';
 import { IPC_CHANNELS } from '../../../../../core/ipc/channels';
-
-
+import { formatMoney, formatQty, roundQty, rupeesToPaise, paiseToRupees } from '../../../../../core/shared/math';
 
 import SearchableSupplierCombobox from '../suppliers/SearchableSupplierCombobox';
 import SpreadsheetProductSelector from './SpreadsheetProductSelector';
 import SupplierForm from '../suppliers/SupplierForm';
+
+function RateHint({
+  supplierId,
+  variantId,
+  unitType,
+  rate,
+}: {
+  supplierId?: number;
+  variantId?: number;
+  unitType?: string;
+  rate?: number;
+}) {
+  const { data: lastRatePaise } = useLastPurchaseRate(supplierId, variantId);
+
+  const isYield = unitType === 'live_dual' || unitType === 'weight';
+  // Standard dressed yield conversion ratio is approximately 1.60 (live kg / 1.60 = dressed kg, or dressed cost = rate * 1.60)
+  const effectiveCostPerKg = isYield && rate && rate > 0 ? (rate * 1.60).toFixed(2) : null;
+
+  if (!lastRatePaise && !effectiveCostPerKg) return null;
+
+  return (
+    <div className="flex flex-col gap-0.5 mt-0.5 select-none leading-tight">
+      {lastRatePaise !== null && lastRatePaise !== undefined && (
+        <span className="text-[9px] text-brand-400 font-mono">
+          Last: ₹{(lastRatePaise / 100).toFixed(2)}
+        </span>
+      )}
+      {effectiveCostPerKg && (
+        <span className="text-[9px] text-amber-400 font-mono" title="Estimated dressed cost per kg (1.6x yield)">
+          Dressed: ~₹{effectiveCostPerKg}/kg
+        </span>
+      )}
+    </div>
+  );
+}
 
 export default function QuickPurchaseEntry() {
 
@@ -29,13 +64,35 @@ export default function QuickPurchaseEntry() {
 
   // Form State and persisted Draft session (Zustand)
   const { draft, setDraftField, setItems, resetDraft } = useQuickPurchaseStore();
-  const { supplierId, receivedDate, billNumber, notes, billPhotoPath, paymentMethod, editingInvoiceId, items } = draft;
+  const {
+    supplierId,
+    receivedDate,
+    billNumber,
+    supplierInvoiceNumber,
+    notes,
+    billPhotoPath,
+    paymentMethod,
+    paidAmount,
+    expectedPaymentDate,
+    discount,
+    tax,
+    freight,
+    otherCharges,
+    editingInvoiceId,
+    items,
+  } = draft;
 
   const setSupplierId = (val: string) => setDraftField('supplierId', val);
   const setReceivedDate = (val: string) => setDraftField('receivedDate', val);
+  const setSupplierInvoiceNumber = (val: string) => setDraftField('supplierInvoiceNumber', val);
   const setNotes = (val: string) => setDraftField('notes', val);
   const setBillPhotoPath = (val: string | null) => setDraftField('billPhotoPath', val);
-  const setPaymentMethod = (val: 'cash' | 'credit') => setDraftField('paymentMethod', val);
+  const setPaymentMethod = (val: 'cash' | 'upi' | 'card' | 'credit' | 'partial') => setDraftField('paymentMethod', val);
+  const setPaidAmount = (val: string) => setDraftField('paidAmount', val);
+  const setDiscount = (val: string) => setDraftField('discount', val);
+  const setTax = (val: string) => setDraftField('tax', val);
+  const setFreight = (val: string) => setDraftField('freight', val);
+  const setOtherCharges = (val: string) => setDraftField('otherCharges', val);
 
   const [showAddSupplierModal, setShowAddSupplierModal] = useState(false);
   const [showNotesInput, setShowNotesInput] = useState(false);
@@ -133,8 +190,79 @@ export default function QuickPurchaseEntry() {
   const calculatedItemsTotal = items.reduce((acc, cur) => acc + cur.subtotal, 0);
   const totalQty = items.reduce((acc, cur) => acc + (parseFloat(cur.quantity) || 0), 0);
 
+  // Financial calculations
+  const discountPaise = Math.round((parseFloat(discount) || 0) * 100);
+  const taxPaise = Math.round((parseFloat(tax) || 0) * 100);
+  const freightPaise = Math.round((parseFloat(freight) || 0) * 100);
+  const otherChargesPaise = Math.round((parseFloat(otherCharges) || 0) * 100);
+  const finalTotalPaise = Math.max(0, calculatedItemsTotal - discountPaise + taxPaise + freightPaise + otherChargesPaise);
+
+  let paidPaise = 0;
+  if (['cash', 'upi', 'card'].includes(paymentMethod)) {
+    paidPaise = paidAmount ? Math.round((parseFloat(paidAmount) || 0) * 100) : finalTotalPaise;
+  } else if (paymentMethod === 'partial') {
+    paidPaise = Math.min(Math.round((parseFloat(paidAmount) || 0) * 100), finalTotalPaise);
+  } else {
+    paidPaise = 0; // credit
+  }
+
+  const outstandingPaise = Math.max(0, finalTotalPaise - paidPaise);
+
+  // Derived purchase status
+  const derivedPurchaseStatus: 'paid' | 'partial' | 'received' | 'draft' =
+    outstandingPaise === 0 && finalTotalPaise > 0
+      ? 'paid'
+      : paidPaise > 0
+      ? 'partial'
+      : 'received';
+
+  const [duplicateWarning, setDuplicateWarning] = useState<string | null>(null);
+  const [showDuplicateConfirmModal, setShowDuplicateConfirmModal] = useState(false);
+
+  // Real-time duplicate check
+  React.useEffect(() => {
+    let active = true;
+    const checkDuplicate = async () => {
+      if (!supplierId || !supplierInvoiceNumber || !supplierInvoiceNumber.trim()) {
+        setDuplicateWarning(null);
+        return;
+      }
+      try {
+        const res = await window.api.invoke(IPC_CHANNELS.INVENTORY.CHECK_DUPLICATE_SUPPLIER_INVOICE, {
+          supplier_id: Number(supplierId),
+          supplier_invoice_number: supplierInvoiceNumber.trim(),
+        });
+        if (active && res.success && res.data) {
+          setDuplicateWarning(`Warning: Supplier invoice "${supplierInvoiceNumber.trim()}" already exists for this supplier!`);
+        } else if (active) {
+          setDuplicateWarning(null);
+        }
+      } catch (err) {
+        // non-fatal
+      }
+    };
+
+    const timer = setTimeout(checkDuplicate, 400);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [supplierId, supplierInvoiceNumber]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (duplicateWarning) {
+      setShowDuplicateConfirmModal(true);
+      return;
+    }
+    doSubmitPurchase(false);
+  };
+
+  const handleSaveDraft = async () => {
+    doSubmitPurchase(true);
+  };
+
+  const doSubmitPurchase = async (isDraft: boolean) => {
     setErrorMsg('');
     setSuccessMsg('');
     setValidationErrors({});
@@ -148,9 +276,9 @@ export default function QuickPurchaseEntry() {
       .filter(item => item.product_variant_id && item.quantity)
       .map(item => ({
         product_variant_id: parseInt(item.product_variant_id),
-        quantity: parseFloat(item.quantity) || 0,
+        quantity: roundQty(parseFloat(item.quantity) || 0),
         unit_type: item.unit_type,
-        unit_price_paise: Math.round((parseFloat(item.unit_price) || 0) * 100),
+        unit_price_paise: rupeesToPaise(parseFloat(item.unit_price) || 0),
         subtotal_paise: item.subtotal,
       }));
 
@@ -162,11 +290,19 @@ export default function QuickPurchaseEntry() {
     const payload = {
       supplier_id: parseInt(supplierId),
       received_date: receivedDate,
-      bill_amount_paise: calculatedItemsTotal,
+      bill_amount_paise: finalTotalPaise,
       bill_number: billNumber || undefined,
+      supplier_invoice_number: supplierInvoiceNumber.trim() || undefined,
       notes: notes || undefined,
       bill_photo_path: billPhotoPath || undefined,
       payment_method: paymentMethod,
+      paid_amount_paise: paidPaise,
+      expected_payment_date: expectedPaymentDate || undefined,
+      discount_paise: discountPaise,
+      tax_paise: taxPaise,
+      freight_charges_paise: freightPaise,
+      other_charges_paise: otherChargesPaise,
+      is_draft: isDraft,
       items: itemsMapped,
     };
 
@@ -192,28 +328,34 @@ export default function QuickPurchaseEntry() {
     try {
       const result = await recordQuickPurchase.mutateAsync(payload);
 
-      setSuccessMsg('Quick Purchase entry saved successfully! Stock and Supplier Ledger updated.');
+      setSuccessMsg(
+        isDraft
+          ? 'Quick Purchase draft saved successfully!'
+          : 'Quick Purchase entry submitted successfully! Stock, Payable Bills, and Double-Entry Ledger updated.'
+      );
 
-      // Auto-open printable invoice
-      const supp = suppliers?.find(s => String(s.id) === supplierId);
-      setInvoiceModalData({
-        invoiceNumber: result?.invoice?.supplier_invoice_number || billNumber || `BILL-${Date.now()}`,
-        invoiceDate: receivedDate,
-        poNumber: result?.invoice?.purchase_ref_number || `PUR-${result?.invoice?.id}`,
-        fromName: supp?.company_name || 'Supplier',
-        billToName: 'Meat Shop Store',
-        items: itemsMapped.map(i => {
-          const v = variants?.find((x: any) => x.id === i.product_variant_id);
-          return {
-            qty: i.quantity,
-            description: v ? `${v.product_name} (${v.variant_name})` : `Item #${i.product_variant_id}`,
-            unitPricePaise: i.unit_price_paise,
-            amountPaise: i.subtotal_paise,
-          };
-        }),
-        subtotalPaise: payload.bill_amount_paise,
-        totalPaise: payload.bill_amount_paise,
-      });
+      // Auto-open printable invoice if not draft
+      if (!isDraft) {
+        const supp = suppliers?.find(s => String(s.id) === supplierId);
+        setInvoiceModalData({
+          invoiceNumber: result?.invoice?.supplier_invoice_number || supplierInvoiceNumber || `BILL-${Date.now()}`,
+          invoiceDate: receivedDate,
+          poNumber: result?.invoice?.purchase_ref_number || `PUR-${result?.invoice?.id}`,
+          fromName: supp?.company_name || 'Supplier',
+          billToName: 'Meat Shop Store',
+          items: itemsMapped.map(i => {
+            const v = variants?.find((x: any) => x.id === i.product_variant_id);
+            return {
+              qty: i.quantity,
+              description: v ? `${v.product_name} (${v.variant_name})` : `Item #${i.product_variant_id}`,
+              unitPricePaise: i.unit_price_paise,
+              amountPaise: i.subtotal_paise,
+            };
+          }),
+          subtotalPaise: payload.bill_amount_paise,
+          totalPaise: payload.bill_amount_paise,
+        });
+      }
 
       // Reset form
       resetDraft();
@@ -258,9 +400,9 @@ export default function QuickPurchaseEntry() {
         .filter(item => item.product_variant_id && item.quantity)
         .map(item => ({
           product_variant_id: parseInt(item.product_variant_id),
-          quantity: parseFloat(item.quantity) || 0,
+          quantity: roundQty(parseFloat(item.quantity) || 0),
           unit_type: item.unit_type,
-          unit_price_paise: Math.round((parseFloat(item.unit_price) || 0) * 100),
+          unit_price_paise: rupeesToPaise(parseFloat(item.unit_price) || 0),
           subtotal_paise: item.subtotal,
         }));
 
@@ -388,10 +530,10 @@ export default function QuickPurchaseEntry() {
                 </div>
               )}
 
-              {/* Form Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4 shrink-0">
-                {/* Supplier (1.5x - 2x wider) */}
-                <div className="sm:col-span-2 md:col-span-2">
+              {/* Form Header Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 shrink-0">
+                {/* Supplier (Wide) */}
+                <div className="sm:col-span-2 md:col-span-2 lg:col-span-2">
                   <label className="block text-xs font-bold text-text-secondary mb-1">
                     Supplier Name *
                   </label>
@@ -415,36 +557,99 @@ export default function QuickPurchaseEntry() {
                     type="date"
                     value={receivedDate}
                     onChange={e => setReceivedDate(e.target.value)}
-                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3 py-2.5 text-xs text-text-primary focus:outline-none focus:border-brand-500 min-h-[46px] font-medium"
+                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500 min-h-[42px] font-medium"
                   />
                   {validationErrors.received_date && (
                     <span className="text-[10px] text-red-400 font-semibold">{validationErrors.received_date}</span>
                   )}
                 </div>
 
-                {/* Invoice Auto Number (Read Only) */}
+                {/* System Purchase Ref No. (Read Only) */}
                 <div>
                   <label className="block text-xs font-bold text-text-secondary mb-1">
-                    Invoice No.
+                    System Purchase Ref
                   </label>
-                  <div className="w-full bg-surface-panel border border-border-subtle/60 text-text-primary rounded-xl px-3 py-2.5 text-xs font-mono font-bold select-all min-h-[46px] flex items-center box-border">
+                  <div className="w-full bg-surface-panel border border-border-subtle/60 text-text-primary rounded-xl px-3 py-2 text-xs font-mono font-bold select-all min-h-[42px] flex items-center box-border">
                     {nextRefNum || `PUR-${todayCleanDate}-001`}
                   </div>
                 </div>
 
-                {/* Payment Option */}
+                {/* Supplier Invoice Number (User Entered) */}
+                <div>
+                  <label className="block text-xs font-bold text-text-secondary mb-1">
+                    Supplier Invoice No.
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. INV-88421"
+                    value={supplierInvoiceNumber}
+                    onChange={e => setSupplierInvoiceNumber(e.target.value)}
+                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3 py-2 text-xs font-mono text-text-primary focus:outline-none focus:border-brand-500 min-h-[42px]"
+                  />
+                  {duplicateWarning && (
+                    <span className="text-[10px] text-amber-400 font-medium block mt-0.5 leading-tight">{duplicateWarning}</span>
+                  )}
+                </div>
+
+                {/* Payment Mode */}
                 <div>
                   <label className="block text-xs font-bold text-text-secondary mb-1">
                     Payment Mode *
                   </label>
                   <select
                     value={paymentMethod}
-                    onChange={e => setPaymentMethod(e.target.value as 'cash' | 'credit')}
-                    className="w-full bg-surface-card border border-border-subtle rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500"
+                    onChange={e => {
+                      const mode = e.target.value as 'cash' | 'upi' | 'card' | 'credit' | 'partial';
+                      setPaymentMethod(mode);
+                      if (mode === 'credit') {
+                        setPaidAmount('0');
+                      } else if (['cash', 'upi', 'card'].includes(mode)) {
+                        setPaidAmount(formatMoney(paiseToRupees(finalTotalPaise)));
+                      }
+                    }}
+                    className="w-full bg-surface-card border border-border-subtle rounded-xl px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-brand-500 min-h-[42px]"
                   >
                     <option value="credit">Credit (Outstanding)</option>
-                    <option value="cash">Cash (Immediate Pay)</option>
+                    <option value="cash">Cash</option>
+                    <option value="upi">UPI</option>
+                    <option value="card">Card</option>
+                    <option value="partial">Partial Payment</option>
                   </select>
+                </div>
+
+                {/* Paid Amount */}
+                <div>
+                  <label className="block text-xs font-bold text-text-secondary mb-1">
+                    Paid Amount (₹)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    placeholder="0.00"
+                    disabled={paymentMethod === 'credit'}
+                    value={paymentMethod === 'credit' ? '0.00' : paidAmount}
+                    onChange={e => setPaidAmount(e.target.value)}
+                    className="w-full bg-surface-card disabled:bg-surface-panel disabled:opacity-70 border border-border-subtle rounded-xl px-3 py-2 text-xs font-mono text-right text-text-primary focus:outline-none focus:border-brand-500 min-h-[42px]"
+                  />
+                </div>
+
+                {/* Outstanding & Status */}
+                <div>
+                  <label className="block text-xs font-bold text-text-secondary mb-1">
+                    Outstanding (₹)
+                  </label>
+                  <div className={`w-full bg-surface-panel border border-border-subtle/60 rounded-xl px-3 py-2 text-xs font-mono font-bold min-h-[42px] flex items-center justify-between ${outstandingPaise > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-sans font-extrabold ${
+                      derivedPurchaseStatus === 'paid'
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                        : derivedPurchaseStatus === 'partial'
+                        ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30'
+                        : 'bg-blue-500/10 text-blue-400 border border-blue-500/30'
+                    }`}>
+                      {derivedPurchaseStatus}
+                    </span>
+                    <span>₹{formatMoney(paiseToRupees(outstandingPaise))}</span>
+                  </div>
                 </div>
               </div>
 
@@ -513,17 +718,19 @@ export default function QuickPurchaseEntry() {
                 </div>
               </div>
 
-              {/* Received Items Entry */}
+              {/* Received Items Entry (Wide, Tall, Touch-Friendly) */}
               <div className="border-t border-border-subtle pt-4 space-y-3 flex-1 flex flex-col min-h-0 overflow-hidden">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-text-secondary shrink-0">
-                  Item Received
-                </h3>
+                <div className="flex items-center justify-between shrink-0">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-text-secondary">
+                    Items Received (Type Item Code or Name → Enter → Quantity → Enter → Rate → Enter)
+                  </h3>
+                </div>
 
                 <div className="border border-border-subtle rounded-xl overflow-hidden shadow-sm bg-surface-panel/5 flex-1 flex flex-col min-h-0">
-                  {/* Dense Headers */}
-                  <div className="grid grid-cols-[60px_3fr_1.2fr_85px_1.2fr_1.5fr_60px] items-center gap-2 bg-surface-panel border-b border-border-subtle text-[10px] uppercase font-bold text-text-muted py-2 px-3 select-none shrink-0">
+                  {/* Wide Touch-Friendly Headers */}
+                  <div className="grid grid-cols-[44px_minmax(280px,4fr)_1.2fr_75px_1.2fr_1.4fr_48px] items-center gap-2.5 bg-surface-panel border-b border-border-subtle text-xs uppercase font-bold text-text-muted py-3 px-3 select-none shrink-0">
                     <div className="text-center">#</div>
-                    <div>Item Variant</div>
+                    <div>Item Variant (Code / Name)</div>
                     <div className="text-right">Quantity</div>
                     <div className="text-center">Unit</div>
                     <div className="text-right">Rate (₹)</div>
@@ -534,23 +741,35 @@ export default function QuickPurchaseEntry() {
                   {/* Committed Items List - Inline Editable */}
                   <div className="flex-1 overflow-y-auto min-h-0 divide-y divide-border-subtle bg-surface-card/30">
                     {items.length === 0 ? (
-                      <div className="py-8 text-center text-text-muted text-xs select-none">
+                      <div className="py-8 text-center text-text-muted text-sm select-none">
                         No items entered yet. Click "+ Add Item Row" below to get started.
                       </div>
                     ) : (
                       items.map((item, idx) => {
                         const unitLabel = item.unit_type === 'weight' ? 'Kg' : (item.unit_type === 'live_dual' ? 'Kg/Pcs' : 'Pcs');
 
+                        const focusRowQty = () => {
+                          setTimeout(() => {
+                            const allRows = document.querySelectorAll('.item-row');
+                            const rowEl = allRows[idx];
+                            const qtyInput = rowEl?.querySelector('.qty-input') as HTMLInputElement | null;
+                            if (qtyInput) {
+                              qtyInput.focus();
+                              qtyInput.select();
+                            }
+                          }, 10);
+                        };
+
                         return (
                           <div
                             key={idx}
-                            className="item-row grid grid-cols-[60px_3fr_1.2fr_85px_1.2fr_1.5fr_60px] items-center gap-2 py-2 px-3 hover:bg-surface-hover/20 transition-colors"
+                            className="item-row grid grid-cols-[44px_minmax(280px,4fr)_1.2fr_75px_1.2fr_1.4fr_48px] items-center gap-2.5 py-2.5 px-3 hover:bg-surface-hover/20 transition-colors"
                           >
                             {/* Row Index */}
-                            <div className="text-center text-xs text-text-muted font-mono select-none">{idx + 1}</div>
+                            <div className="text-center text-sm text-text-muted font-mono font-bold select-none">{idx + 1}</div>
                             
-                            {/* Product Selector */}
-                            <div className="h-9 relative bg-surface-card border border-border-subtle rounded-lg overflow-visible">
+                            {/* Product Selector (Wide, Tall, Touch-Friendly) */}
+                            <div className="min-h-[48px] relative bg-surface-card border border-border-subtle rounded-lg overflow-visible flex items-center">
                               <SpreadsheetProductSelector
                                 variants={variants || []}
                                 selectedVariantId={item.product_variant_id ? Number(item.product_variant_id) : null}
@@ -560,20 +779,20 @@ export default function QuickPurchaseEntry() {
                                     ...updated[idx],
                                     product_variant_id: variant ? String(variant.id) : '',
                                     unit_type: variant ? variant.unit_type : 'weight',
-                                    unit_price: variant ? String(variant.current_rate_paise_per_unit / 100) : '',
+                                    unit_price: variant ? String(paiseToRupees(variant.current_rate_paise_per_unit || 0)) : '',
                                   };
-                                  const qty = parseFloat(updated[idx].quantity) || 0;
+                                  const qty = roundQty(parseFloat(updated[idx].quantity) || 0);
                                   const rate = parseFloat(updated[idx].unit_price) || 0;
-                                  updated[idx].subtotal = Math.round(qty * rate * 100);
+                                  updated[idx].subtotal = rupeesToPaise(qty * rate);
                                   setItems(updated);
+                                }}
+                                onItemSelected={() => {
+                                  focusRowQty();
                                 }}
                                 onKeyDown={(e) => {
                                   if (e.key === 'Enter') {
                                     e.preventDefault();
-                                    const rowEl = (e.target as HTMLElement).closest('.item-row');
-                                    const qtyInput = rowEl?.querySelector('.qty-input') as HTMLInputElement;
-                                    qtyInput?.focus();
-                                    qtyInput?.select();
+                                    focusRowQty();
                                   }
                                 }}
                                 inputRef={() => {}}
@@ -581,11 +800,11 @@ export default function QuickPurchaseEntry() {
                             </div>
 
                             {/* Quantity Input */}
-                            <div className="h-9 bg-surface-card border border-border-subtle rounded-lg overflow-hidden">
+                            <div className="min-h-[48px] bg-surface-card border border-border-subtle rounded-lg overflow-hidden flex items-center">
                               <input
                                 type="number"
                                 step="0.001"
-                                placeholder="0.00"
+                                placeholder="0.000"
                                 value={item.quantity}
                                 onChange={e => {
                                   const updated = [...items];
@@ -593,9 +812,9 @@ export default function QuickPurchaseEntry() {
                                     ...updated[idx],
                                     quantity: e.target.value
                                   };
-                                  const qty = parseFloat(updated[idx].quantity) || 0;
+                                  const qty = roundQty(parseFloat(updated[idx].quantity) || 0);
                                   const rate = parseFloat(updated[idx].unit_price) || 0;
-                                  updated[idx].subtotal = Math.round(qty * rate * 100);
+                                  updated[idx].subtotal = rupeesToPaise(qty * rate);
                                   setItems(updated);
                                 }}
                                 onKeyDown={e => {
@@ -607,80 +826,88 @@ export default function QuickPurchaseEntry() {
                                     rateInput?.select();
                                   }
                                 }}
-                                className="qty-input w-full h-full bg-transparent px-3 text-xs font-mono text-text-primary text-right focus:outline-none focus:bg-brand-500/5 focus:ring-1 focus:ring-brand-500"
+                                className="qty-input w-full h-full min-h-[48px] bg-transparent px-3 text-sm sm:text-base font-mono font-bold text-text-primary text-right focus:outline-none focus:bg-brand-500/10 focus:ring-2 focus:ring-brand-500 rounded-lg"
                               />
                             </div>
 
                             {/* Unit */}
-                            <div className="text-center text-xs text-text-muted font-bold select-none">
+                            <div className="text-center text-sm text-text-muted font-bold select-none">
                               {item.product_variant_id ? unitLabel : '-'}
                             </div>
 
-                            {/* Rate Input */}
-                            <div className="h-9 bg-surface-card border border-border-subtle rounded-lg overflow-hidden">
-                              <input
-                                type="number"
-                                step="0.01"
-                                placeholder="0.00"
-                                value={item.unit_price}
-                                onChange={e => {
-                                  const updated = [...items];
-                                  updated[idx] = {
-                                    ...updated[idx],
-                                    unit_price: e.target.value
-                                  };
-                                  const qty = parseFloat(updated[idx].quantity) || 0;
-                                  const rate = parseFloat(updated[idx].unit_price) || 0;
-                                  updated[idx].subtotal = Math.round(qty * rate * 100);
-                                  setItems(updated);
-                                }}
-                                onKeyDown={e => {
-                                  if (e.key === 'Enter') {
-                                    e.preventDefault();
-                                    const isLastRow = idx === items.length - 1;
-                                    if (isLastRow) {
-                                      setItems(prev => [
-                                        ...prev,
-                                        {
-                                          product_variant_id: '',
-                                          quantity: '',
-                                          unit_type: 'weight',
-                                          unit_price: '',
-                                          subtotal: 0
-                                        }
-                                      ]);
-                                      setTimeout(() => {
+                            {/* Rate Input & Hints */}
+                            <div className="flex flex-col">
+                              <div className="min-h-[48px] bg-surface-card border border-border-subtle rounded-lg overflow-hidden flex items-center">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  placeholder="0.00"
+                                  value={item.unit_price}
+                                  onChange={e => {
+                                    const updated = [...items];
+                                    updated[idx] = {
+                                      ...updated[idx],
+                                      unit_price: e.target.value
+                                    };
+                                    const qty = roundQty(parseFloat(updated[idx].quantity) || 0);
+                                    const rate = parseFloat(updated[idx].unit_price) || 0;
+                                    updated[idx].subtotal = rupeesToPaise(qty * rate);
+                                    setItems(updated);
+                                  }}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      const isLastRow = idx === items.length - 1;
+                                      if (isLastRow) {
+                                        setItems(prev => [
+                                          ...prev,
+                                          {
+                                            product_variant_id: '',
+                                            quantity: '',
+                                            unit_type: 'weight',
+                                            unit_price: '',
+                                            subtotal: 0
+                                          }
+                                        ]);
+                                        setTimeout(() => {
+                                          const allRows = document.querySelectorAll('.item-row');
+                                          const lastRow = allRows[allRows.length - 1];
+                                          const productInput = lastRow?.querySelector('input[type="text"]') as HTMLInputElement;
+                                          productInput?.focus();
+                                        }, 50);
+                                      } else {
                                         const allRows = document.querySelectorAll('.item-row');
-                                        const lastRow = allRows[allRows.length - 1];
-                                        const productInput = lastRow?.querySelector('input[type="text"]') as HTMLInputElement;
+                                        const nextRow = allRows[idx + 1];
+                                        const productInput = nextRow?.querySelector('input[type="text"]') as HTMLInputElement;
                                         productInput?.focus();
-                                      }, 50);
-                                    } else {
-                                      const allRows = document.querySelectorAll('.item-row');
-                                      const nextRow = allRows[idx + 1];
-                                      const productInput = nextRow?.querySelector('input[type="text"]') as HTMLInputElement;
-                                      productInput?.focus();
+                                      }
                                     }
-                                  }
-                                }}
-                                className="rate-input w-full h-full bg-transparent px-3 text-xs font-mono text-text-primary text-right focus:outline-none focus:bg-brand-500/5 focus:ring-1 focus:ring-brand-500"
+                                  }}
+                                  className="rate-input w-full h-full min-h-[48px] bg-transparent px-3 text-sm sm:text-base font-mono font-bold text-text-primary text-right focus:outline-none focus:bg-brand-500/10 focus:ring-2 focus:ring-brand-500 rounded-lg"
+                                />
+                              </div>
+                              <RateHint
+                                supplierId={selectedSupplierIdNum}
+                                variantId={item.product_variant_id ? Number(item.product_variant_id) : undefined}
+                                unitType={item.unit_type}
+                                rate={parseFloat(item.unit_price) || 0}
                               />
                             </div>
 
                             {/* Subtotal */}
-                            <div className="text-right px-3 font-mono text-xs font-bold text-brand-400 select-none">
-                              ₹{((parseFloat(item.quantity) || 0) * (parseFloat(item.unit_price) || 0)).toFixed(2)}
+                            <div className="text-right px-3 font-mono text-sm sm:text-base font-black text-brand-400 select-none">
+                              ₹{formatMoney((parseFloat(item.quantity) || 0) * (parseFloat(item.unit_price) || 0))}
                             </div>
 
                             {/* Delete Action */}
-                            <div className="text-center select-none">
+                            <div className="text-center select-none flex items-center justify-center">
                               <button
                                 type="button"
                                 onClick={() => handleRemoveCommittedItem(idx)}
-                                className="text-text-muted hover:text-red-400 p-1 transition-opacity"
+                                className="text-text-muted hover:text-red-400 p-2 rounded-lg hover:bg-red-500/10 transition-colors"
                                 title="Remove Item"
                               >
-                                <Trash2 size={13} />
+                                <Trash2 size={16} />
                               </button>
                             </div>
                           </div>
@@ -704,8 +931,14 @@ export default function QuickPurchaseEntry() {
                             subtotal: 0
                           }
                         ]);
+                        setTimeout(() => {
+                          const allRows = document.querySelectorAll('.item-row');
+                          const lastRow = allRows[allRows.length - 1];
+                          const productInput = lastRow?.querySelector('input[type="text"]') as HTMLInputElement;
+                          productInput?.focus();
+                        }, 50);
                       }}
-                      className="px-3 py-1.5 bg-surface-card hover:bg-surface-hover border border-border-subtle text-xs font-bold text-brand-500 rounded-lg flex items-center gap-1.5 transition-all w-fit"
+                      className="px-4 py-2 bg-surface-card hover:bg-surface-hover border border-border-subtle text-xs sm:text-sm font-bold text-brand-500 rounded-lg flex items-center gap-1.5 transition-all w-fit min-h-[42px]"
                     >
                       + Add Item Row
                     </button>
@@ -713,14 +946,14 @@ export default function QuickPurchaseEntry() {
 
                   {/* Live Totals Row */}
                   {items.length > 0 && (
-                    <div className="grid grid-cols-[60px_3fr_1.2fr_85px_1.2fr_1.5fr_60px] items-center gap-2 bg-surface-panel border-t border-border-subtle font-bold text-xs text-text-primary py-2 px-3 select-none shrink-0">
+                    <div className="grid grid-cols-[44px_minmax(280px,4fr)_1.2fr_75px_1.2fr_1.4fr_48px] items-center gap-2.5 bg-surface-panel border-t border-border-subtle font-bold text-sm text-text-primary py-3 px-3 select-none shrink-0">
                       <div className="text-center"></div>
-                      <div className="text-right text-text-muted uppercase text-[9px] tracking-wider font-extrabold">Total</div>
-                      <div className="text-right font-mono">{totalQty.toFixed(2)}</div>
+                      <div className="text-right text-text-muted uppercase text-xs tracking-wider font-extrabold">Total</div>
+                      <div className="text-right font-mono">{formatQty(totalQty)}</div>
                       <div></div>
                       <div></div>
-                      <div className="text-right font-mono text-brand-400 text-sm">
-                        ₹{(calculatedItemsTotal / 100).toFixed(2)}
+                      <div className="text-right font-mono text-brand-400 text-base font-black">
+                        ₹{formatMoney(paiseToRupees(calculatedItemsTotal))}
                       </div>
                       <div></div>
                     </div>
@@ -728,23 +961,143 @@ export default function QuickPurchaseEntry() {
                 </div>
               </div>
 
+              {/* Totals & Charges Section */}
+              <div className="bg-surface-panel/40 border border-border-subtle rounded-xl p-3 shrink-0 space-y-3">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-text-secondary">
+                  Additional Charges & Taxes
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-text-muted mb-1">
+                      Discount (₹)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="0.00"
+                      value={discount}
+                      onChange={e => setDiscount(e.target.value)}
+                      className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono text-right text-text-primary focus:outline-none focus:border-brand-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-text-muted mb-1">
+                      Tax / GST (₹)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="0.00"
+                      value={tax}
+                      onChange={e => setTax(e.target.value)}
+                      className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono text-right text-text-primary focus:outline-none focus:border-brand-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-text-muted mb-1">
+                      Freight Charges (₹)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="0.00"
+                      value={freight}
+                      onChange={e => setFreight(e.target.value)}
+                      className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono text-right text-text-primary focus:outline-none focus:border-brand-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-text-muted mb-1">
+                      Other Charges (₹)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="0.00"
+                      value={otherCharges}
+                      onChange={e => setOtherCharges(e.target.value)}
+                      className="w-full bg-surface-card border border-border-subtle rounded-lg px-2.5 py-1.5 text-xs font-mono text-right text-text-primary focus:outline-none focus:border-brand-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Financial Summary Strip */}
+                <div className="flex flex-wrap items-center justify-between gap-4 pt-2 border-t border-border-subtle/50 text-xs">
+                  <div className="flex items-center gap-4">
+                    <div>
+                      <span className="text-text-muted">Subtotal: </span>
+                      <span className="font-mono font-semibold text-text-primary">
+                        {formatPaise(calculatedItemsTotal)}
+                      </span>
+                    </div>
+                    {discountPaise > 0 && (
+                      <div>
+                        <span className="text-text-muted">Discount: </span>
+                        <span className="font-mono font-semibold text-rose-400">
+                          -{formatPaise(discountPaise)}
+                        </span>
+                      </div>
+                    )}
+                    {(taxPaise > 0 || freightPaise > 0 || otherChargesPaise > 0) && (
+                      <div>
+                        <span className="text-text-muted">Charges & Tax: </span>
+                        <span className="font-mono font-semibold text-amber-400">
+                          +{formatPaise(taxPaise + freightPaise + otherChargesPaise)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-6">
+                    <div>
+                      <span className="text-text-muted">Final Total: </span>
+                      <span className="font-mono font-bold text-text-primary text-sm">
+                        {formatPaise(finalTotalPaise)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-text-muted">Paid: </span>
+                      <span className="font-mono font-bold text-emerald-400 text-sm">
+                        {formatPaise(paidPaise)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-text-muted">Outstanding: </span>
+                      <span className={`font-mono font-bold text-sm ${outstandingPaise > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                        {formatPaise(outstandingPaise)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               {/* Bottom Actions */}
               <div className="flex items-center justify-between pt-3 border-t border-border-subtle shrink-0">
                 <div className="text-xs">
-                  <span className="text-text-muted">Purchase Total: </span>
-                  <span className="font-mono font-bold text-text-primary text-sm">
-                    {formatPaise(calculatedItemsTotal)}
+                  <span className="text-text-muted">Final Bill Total: </span>
+                  <span className="font-mono font-bold text-brand-400 text-base">
+                    {formatPaise(finalTotalPaise)}
                   </span>
                 </div>
 
-                <button
-                  type="submit"
-                  disabled={recordQuickPurchase.isPending}
-                  className="px-6 py-2.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg disabled:opacity-50 transition-all"
-                >
-                  <Save size={16} />
-                  {recordQuickPurchase.isPending ? 'Saving...' : 'Submit Quick Purchase'}
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleSaveDraft}
+                    disabled={recordQuickPurchase.isPending}
+                    className="px-4 py-2.5 bg-surface-card hover:bg-surface-hover border border-border-subtle text-text-secondary hover:text-text-primary rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all disabled:opacity-50"
+                  >
+                    Save as Draft
+                  </button>
+
+                  <button
+                    type="submit"
+                    disabled={recordQuickPurchase.isPending}
+                    className="px-6 py-2.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg disabled:opacity-50 transition-all"
+                  >
+                    <Save size={16} />
+                    {recordQuickPurchase.isPending ? 'Saving...' : 'Submit & Receive Purchase'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>
@@ -939,6 +1292,46 @@ export default function QuickPurchaseEntry() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Duplicate Invoice Number Confirmation Modal */}
+      {showDuplicateConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+          <div className="bg-surface-panel border border-border-subtle rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-text-primary">
+            <div>
+              <h3 className="text-base font-bold font-outfit text-amber-400 flex items-center gap-2">
+                <AlertCircle size={18} />
+                Duplicate Invoice Warning
+              </h3>
+              <p className="text-xs text-text-muted mt-2 leading-relaxed">
+                A purchase invoice with number <span className="font-mono font-bold text-amber-300">"{supplierInvoiceNumber.trim()}"</span> has already been recorded for this supplier.
+              </p>
+              <p className="text-xs text-text-secondary mt-1.5">
+                Are you sure you want to proceed and save this purchase anyway?
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowDuplicateConfirmModal(false)}
+                className="px-4 py-2 bg-surface-card hover:bg-surface-hover border border-border-subtle rounded-lg text-text-secondary font-bold text-xs"
+              >
+                No, Change Invoice No.
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDuplicateConfirmModal(false);
+                  doSubmitPurchase(false);
+                }}
+                className="px-5 py-2 bg-amber-500 hover:bg-amber-600 text-black font-bold rounded-lg text-xs flex items-center gap-1.5"
+              >
+                Yes, Proceed Anyway
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -163,6 +163,10 @@ export interface InvoiceItem {
   unit_type?: 'weight' | 'piece' | 'live_dual';
   product_code?: string;
   category?: string;
+  stock_product_id?: number | null;
+  stock_link_mode?: string | null;
+  conversion_rate_used?: number | null;
+  deducted_qty?: number | null;
 }
 
 export interface InvoiceDetail {
@@ -276,6 +280,7 @@ export interface IInvoiceRepository {
   // Items
   addItem(item: AddInvoiceItemRepoInput): InvoiceItem;
   updateItemQty(id: number, quantityGrams: number | null, quantityUnits: number | null, subtotalPaise: number, totalPaise: number): void;
+  updateItemRate(id: number, ratePaise: number, subtotalPaise: number, totalPaise: number, reason?: string | null): void;
   removeItem(id: number): void;
   findItemsByInvoiceId(invoiceId: number): InvoiceItem[];
   findItemById(id: number): InvoiceItem;
@@ -751,8 +756,10 @@ export interface PurchaseInvoiceRow {
   round_off_paise: number;
   total_amount_paise: number;
   outstanding_amount_paise: number;
+  paid_amount_paise?: number;
+  expected_payment_date?: string | null;
   payment_status: 'unpaid' | 'partially_paid' | 'paid';
-  status: 'pending_approval' | 'approved' | 'rejected';
+  status: 'pending_approval' | 'approved' | 'rejected' | 'draft';
   file_path: string | null;
   purchase_ref_number?: string | null;
   created_by: number;
@@ -791,6 +798,8 @@ export interface CreatePurchaseInvoiceRepoInput {
   round_off_paise?: number;
   total_amount_paise: number;
   outstanding_amount_paise: number;
+  paid_amount_paise?: number;
+  expected_payment_date?: string | null;
   payment_status: PurchaseInvoiceRow['payment_status'];
   status: PurchaseInvoiceRow['status'];
   file_path?: string | null;

@@ -32,6 +32,10 @@ export const CRITICAL_SCHEMA_MANIFEST: SchemaManifestItem[] = [
   { table: 'live_chicken_batches', columns: ['id', 'batch_number', 'remaining_weight_grams', 'remaining_count', 'status'] },
   { table: 'processing_events', columns: ['id', 'event_number', 'batch_id', 'live_weight_grams', 'processed_weight_grams', 'yield_ratio_used'] },
   { table: 'refrigerator_stock', columns: ['id', 'item_name', 'item_type', 'quantity_grams', 'count', 'status'] },
+  { table: 'live_chicken_yield_settings', columns: ['id', 'yield_enabled', 'track_liver_gizzard', 'whole_chicken_grams', 'liver_grams', 'gizzard_grams'] },
+  { table: 'live_animal_yield_configs', columns: ['id', 'animal_key', 'display_name', 'live_tracking_enabled', 'track_byproducts'] },
+  { table: 'live_yield_ratios', columns: ['id', 'animal_key', 'product_id', 'variant_id', 'role', 'grams_per_kg_live'] },
+  { table: 'live_animal_sale_deductions', columns: ['id', 'invoice_id', 'invoice_item_id', 'batch_id', 'animal_type', 'sold_grams', 'live_grams_deducted'] },
 ];
 
 /**

@@ -11,7 +11,7 @@ import {
   PivotResult,
   RolePermissionContext,
 } from '../../types/reports.types';
-import { reportDefinitionsRegistry } from './report_definitions';
+import { reportDefinitionsRegistry, getReportDefinition } from './report_definitions';
 import { dataSourcesCatalog } from './report_data_sources';
 
 import { assertValidDateRange } from '../../../../core/utils/date_validation';
@@ -582,7 +582,7 @@ export class ReportEngine {
   }
 
   public getDefinition(reportId: string): ReportDefinition | undefined {
-    return reportDefinitionsRegistry.find(r => r.id === reportId);
+    return getReportDefinition(reportId);
   }
 
   public getFilterOptions(): ReportFilterOptions {

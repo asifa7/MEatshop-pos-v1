@@ -18,8 +18,8 @@ export const backupService = {
       if (customPath) {
         destDir = customPath;
       } else {
-        const userData = app?.getPath ? app.getPath('userData') : path.join(process.cwd(), 'backups');
-        destDir = path.join(userData, 'backups');
+        const localBackups = path.join(process.cwd(), 'backups');
+        destDir = localBackups;
       }
 
       if (!fs.existsSync(destDir)) {
@@ -286,5 +286,60 @@ export const backupService = {
       logger.error('Failed to export to CSV', err);
       throw err;
     }
+  },
+
+  /**
+   * Discovers the latest database snapshot across db_backups/ and backups/ folders.
+   */
+  getLatestBackupFile(): { filePath: string; fileName: string; mtime: Date; sizeBytes: number } | null {
+    const searchDirs = [
+      path.join(process.cwd(), 'db_backups'),
+      path.join(process.cwd(), 'backups'),
+    ];
+
+    let newest: { filePath: string; fileName: string; mtime: Date; sizeBytes: number } | null = null;
+    let newestMtime = 0;
+
+    for (const dir of searchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        if (!file.endsWith('.db') || file.includes('-wal') || file.includes('-shm')) continue;
+        const fullPath = path.join(dir, file);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.mtimeMs > newestMtime && stat.size > 0) {
+            newestMtime = stat.mtimeMs;
+            newest = {
+              filePath: fullPath,
+              fileName: file,
+              mtime: stat.mtime,
+              sizeBytes: stat.size,
+            };
+          }
+        } catch {}
+      }
+    }
+    return newest;
+  },
+
+  /**
+   * 1-Click Emergency Database Recovery: restores from the latest automated shutdown or pre-migration snapshot.
+   */
+  async restoreLatestEmergencyBackup(): Promise<{ success: boolean; backupFile: string; liveDbPath: string; integrity: string }> {
+    const latest = this.getLatestBackupFile();
+    if (!latest) {
+      throw new Error('No valid database backup snapshots found in db_backups/ or backups/.');
+    }
+
+    logger.info('Performing 1-click emergency database recovery from latest snapshot...', { backup: latest.filePath });
+    const result = await this.restoreDatabase(latest.filePath);
+    return {
+      success: true,
+      backupFile: latest.fileName,
+      liveDbPath: result.liveDbPath,
+      integrity: result.integrity,
+    };
   }
 };
+

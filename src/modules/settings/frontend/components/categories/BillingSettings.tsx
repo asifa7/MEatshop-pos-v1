@@ -154,6 +154,45 @@ export const BillingSettings: React.FC = () => {
             }
           />
         </SettingRow>
+
+        <SettingRow
+          label="Assume Exact Cash When Blank"
+          description="When cashier clicks Complete & Print without typing cash received, treat as exact tender (default: OFF, requires cash entry)"
+        >
+          <SwitchControl
+            checked={bill?.assumeExactCashWhenBlank ?? false}
+            onChange={(checked) =>
+              updateDraftConfig((prev) => ({
+                ...prev,
+                billingSettings: { ...(prev.billingSettings || {}), assumeExactCashWhenBlank: checked },
+              }))
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
+          label="Terminal Inactivity Lock Timeout"
+          description="Automatically lock the register after inactivity without ending shift or losing cart items"
+        >
+          <select
+            value={bill?.idleTimeoutHours ?? 12}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              updateDraftConfig((prev) => ({
+                ...prev,
+                billingSettings: { ...(prev.billingSettings || {}), idleTimeoutHours: val },
+              }));
+              localStorage.setItem('pos_idle_timeout_hours', String(val));
+            }}
+            className="w-48 bg-surface-card border border-border-subtle rounded-lg px-3 py-2 text-xs font-semibold text-text-primary"
+          >
+            <option value={1}>1 Hour</option>
+            <option value={4}>4 Hours</option>
+            <option value={8}>8 Hours</option>
+            <option value={12}>12 Hours (Default)</option>
+            <option value={0}>Never Lock Automatically</option>
+          </select>
+        </SettingRow>
       </SettingCard>
 
       {/* Thermal Receipt Layout & Content */}
@@ -260,6 +299,29 @@ export const BillingSettings: React.FC = () => {
             }
             placeholder="Goods once sold cannot be returned without original receipt."
             className="w-80"
+          />
+        </SettingRow>
+      </SettingCard>
+
+      {/* WhatsApp Bill Dispatch */}
+      <SettingCard
+        title="WhatsApp Bill Dispatch"
+        description="Settings for counter digital bill delivery via WhatsApp"
+        icon={<Zap size={16} className="text-emerald-500" />}
+      >
+        <SettingRow
+          label="Auto-Open WhatsApp Bill on Sale Complete"
+          description="Launch wa.me window automatically upon checkout when customer has provided mobile and consent. Turn off during busy rush hours to maximize cashier speed."
+        >
+          <SwitchControl
+            checked={bill?.autoOpenWhatsAppBill ?? false}
+            onChange={(val: boolean) =>
+              updateDraftConfig((prev) => ({
+                ...prev,
+                billingSettings: { ...(prev.billingSettings || {}), autoOpenWhatsAppBill: val },
+              }))
+            }
+            label={bill?.autoOpenWhatsAppBill ? 'Enabled (Auto-opens on bill completion)' : 'Disabled (High-speed counter mode)'}
           />
         </SettingRow>
       </SettingCard>

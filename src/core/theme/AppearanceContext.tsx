@@ -13,6 +13,9 @@ export interface AppearanceConfig {
   skipPaymentConfirmation: boolean;
   showCalculatorWidget: boolean;
   defaultPaymentMethod: 'cash' | 'upi' | 'card';
+  billingStyle?: 'standard' | 'express';
+  sidebarCollapsed?: boolean;
+  sidebarHoverExpand?: boolean;
 }
 
 const DEFAULT_CONFIG: AppearanceConfig = {
@@ -24,6 +27,9 @@ const DEFAULT_CONFIG: AppearanceConfig = {
   skipPaymentConfirmation: false,
   showCalculatorWidget: true,
   defaultPaymentMethod: 'cash',
+  billingStyle: 'standard',
+  sidebarCollapsed: false,
+  sidebarHoverExpand: true,
 };
 
 interface AppearanceContextType {
